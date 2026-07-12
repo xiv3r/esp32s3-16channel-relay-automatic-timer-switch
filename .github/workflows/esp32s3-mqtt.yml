@@ -33,8 +33,8 @@ jobs:
         git clone --depth 1 --branch 1.14.1 https://github.com/adafruit/RTClib.git ~/Arduino/libraries/RTClib
 
         # Compile Firmware
-        cd ESP32-S3-MQTT
-        mv *.ino ESP32-S3-MQTT.ino
+        cd ESP32S3-MQTT
+        mv *.ino ESP32S3-MQTT.ino
         arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi --clean --output-dir firmware .
 
         # Rename
@@ -97,6 +97,6 @@ jobs:
       with:
         tag_name: ${{ steps.get_tag.outputs.tag_name }}
         files: |
-          ESP32-S3-MQTT/firmware/*.bin
+          ESP32S3-MQTT/firmware/*.bin
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
