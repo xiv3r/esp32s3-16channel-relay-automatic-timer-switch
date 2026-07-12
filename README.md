@@ -2,13 +2,13 @@
 - 5V 1-16 Channel Relay
 - ESP32-S3 N16R8 (16mb flash 8mb ram)
 - DS3231 RTC Module (offline recommended)
-- Female to Female Dupont Wires
+- Female to Male Dupont Wires
+- ESP32-S3 Expansion board
 - Stabe Wifi Connection (opt. if no ds3231)
 - 5V 2-5A Power Supply
 
 `Optional`
 - 5v UPS (Maintain Internal RTC time without DS3231 or NTP)
-- ESP32-S3 Expansion board
 
 # Libraries
 - ArduinoJson
