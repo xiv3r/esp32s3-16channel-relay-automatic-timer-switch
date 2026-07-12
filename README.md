@@ -16,7 +16,23 @@
 - RTCLib 1.14.1
 
 # Installation
-- Download the Firmware and Flash
+### ESP32 Win/Linux Drivers
+- CH340G: https://sparks.gogo.co.nz/ch340.html
+- CP2102: https://www.silabs.com/software-and-tools/usb-to-uart-bridge-vcp-drivers?tab=downloads
+- FT232: https://ftdichip.com/wp-content/uploads/2025/03/CDM-v2.12.36.20-Universal-Driver-for-x64-WHQL-Certified.zip
+## Flasher
+### Android (otg)
+- https://play.google.com/store/apps/details?id=io.serialflow.espflash
+### Windows
+- https://dl.espressif.com/public/flash_download_tool.zip
+### Linux
+```
+esptool --port <PORT> write_flash 0x0 esp32-dump-0x0.bin
+```
+### Win/Linux Browser
+- https://g3gg0.github.io/esp32_flasher/flasher.html
+
+### Download the Firmware and Flash
 - https://github.com/xiv3r/esp32s3-16channel-relay-automatic-timer-switch/releases/tag/esp32s3
 - Flash Offset
 ```
