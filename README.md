@@ -34,6 +34,10 @@ esp32s3-dump-0x0.bin: 0x0
 > offline
 - Go to `192.168.4.1 -> Time` then tap sync browser to set the rtc time 
 
+# Set Country Time
+- Go to Time > GMT Offset and place your country gmt offset in seconds
+- https://github.com/xiv3r/esp32s3-16channel-relay-automatic-timer-switch/blob/main/gmt-offsets-seconds.md
+
 # Access
 - mDNS:`esp32-s3-16ch-timer-switch.local`
 - Captive Portal:`Auto redirect`
