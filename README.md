@@ -24,7 +24,7 @@ https://github.com/xiv3r/esp32-automatic-timer-switch/releases/tag/esp32s3
 esp32s3-dump-0x0.bin: 0x0
 ```
 # Wifi Key
-- Wifi Name:`ESP32_S3_16CH_Timer_Switch`
+- Wifi Name:`ESP32S3_16CH_Timer_Switch`
 - Password:`ESP32-admin`
 
 # Setup
