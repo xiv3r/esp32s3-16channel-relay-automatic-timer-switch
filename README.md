@@ -17,8 +17,7 @@
 
 # Installation
 - Download the Firmware and Flash
-
-https://github.com/xiv3r/esp32s3-16channel-relay-automatic-timer-switch/releases/tag/esp32s3
+- https://github.com/xiv3r/esp32s3-16channel-relay-automatic-timer-switch/releases/tag/esp32s3
 - Flash Offset
 ```
 esp32s3-dump-0x0.bin: 0x0
