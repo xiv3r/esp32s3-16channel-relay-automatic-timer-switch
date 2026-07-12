@@ -23,6 +23,8 @@
 ## Flasher
 ### Android (otg)
 - https://play.google.com/store/apps/details?id=io.serialflow.espflash
+### Android Termux
+- https://github.com/7wp81x/Termux-ESP-Flasher
 ### Windows
 - https://dl.espressif.com/public/flash_download_tool.zip
 ### Linux
@@ -31,13 +33,13 @@ esptool --port <PORT> write_flash 0x0 esp32-dump-0x0.bin
 ```
 ### Win/Linux Browser
 - https://g3gg0.github.io/esp32_flasher/flasher.html
-
 ### Download the Firmware and Flash
 - https://github.com/xiv3r/esp32s3-16channel-relay-automatic-timer-switch/releases/tag/esp32s3
 - Flash Offset
 ```
 esp32s3-dump-0x0.bin: 0x0
 ```
+
 # Wifi Key
 - Wifi Name:`ESP32S3_16CH_Timer_Switch`
 - Password:`ESP32-admin`
