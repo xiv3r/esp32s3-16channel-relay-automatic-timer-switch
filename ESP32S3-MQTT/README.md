@@ -15,7 +15,7 @@ IN7  _____ 13  Relay 7
 IN8  _____ 14  Relay 8
 IN9  _____ 1   Relay 9
 IN10 _____ 2   Relay 10
-IN11 _____ 42   Relay 11
+IN11 _____ 42  Relay 11
 IN12 _____ 41  Relay 12
 IN13 _____ 47  Relay 13
 IN14 _____ 21  Relay 14
