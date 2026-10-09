@@ -13,7 +13,7 @@
 # Libraries
 - ArduinoJson
 - PubSubClient
-- RTCLib 1.14.1
+- RTClib
 
 # Installation
 ### ESP32 Win/Linux Drivers
