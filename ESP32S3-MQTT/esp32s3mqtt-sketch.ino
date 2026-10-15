@@ -1,6 +1,6 @@
 /*
 ===============================================================================
- *  ESP32S3 16-Channel Automatic Relay Timer Switch w/ full MQTT
+ *  ESP32S3 16-Channel Automatic Relay Timer Switch w/ Full MQTT
  *  Author: Raff Alds
  *  Github: https://www.github.com/xiv3r
  *  License: GPLv3
@@ -9,7 +9,6 @@
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
@@ -25,10 +24,9 @@
 Preferences preferences;
 #define NVS_NAMESPACE "relay16"
 #define EEPROM_MAGIC   0x1234
-#define EEPROM_VERSION 13
+#define EEPROM_VERSION 14
 #define EXT_CFG_MAGIC  0xEC
 #define RELAY_CONFIG_MAGIC 0x1CE5
-#define MQTT_CFG_MAGIC 0xA7
 
 // =============================================================================
 //  Year 2106+ Support
@@ -52,6 +50,12 @@ static const unsigned long WIFI_CONNECT_TIMEOUT =   20000UL;
 static const unsigned long SCHEDULE_PROCESS_INTERVAL = 250UL;
 static const unsigned long RTC_REBASE_INTERVAL  =  300000UL;
 static const unsigned long DS3231_SYNC_INTERVAL =  3600000UL;
+
+// =============================================================================
+//  DST Cache Timing
+// =============================================================================
+static const unsigned long DST_CACHE_TTL_SECONDS = 5ULL;
+static const unsigned long DST_CACHE_INVALIDATE_INTERVAL = 5000UL;
 
 // =============================================================================
 //  NTP Async State Machine Constants
@@ -149,7 +153,6 @@ const byte       DNS_PORT = 53;
 #define MAX_RELAYS 16
 // change gpio
 const uint8_t DEFAULT_RELAY_PINS[] = {4, 5, 6, 7, 11, 12, 13, 14, 1, 2, 42, 41, 47, 21, 20, 19};
-static const uint8_t SAFE_PINS[] = {4, 5, 6, 7, 11, 12, 13, 14, 1, 2, 42, 41, 47, 21, 20, 19};
 
 // =============================================================================
 //  Dynamic GPIO Config
@@ -174,6 +177,7 @@ struct TimerSchedule {
     uint32_t monthDays[8];
     uint16_t monthMask[8];
 };
+
 struct RelayConfig {
     TimerSchedule schedule;
     bool          manualOverride;
@@ -181,6 +185,7 @@ struct RelayConfig {
     char          name[16];
     uint16_t      magic;
 };
+
 struct SystemConfig {
     uint16_t magic;
     uint8_t  version;
@@ -192,7 +197,12 @@ struct SystemConfig {
     int32_t  gmt_offset;
     int32_t  daylight_offset;
     uint64_t last_rtc_epoch;
+    char     tz_name[32];
+    uint8_t  tz_rule_id;
+    uint8_t  tz_auto_dst;
+    uint8_t  tz_reserved[2];
 } __attribute__((packed));
+
 struct ExtConfig {
     uint8_t magic;
     uint8_t ap_channel;
@@ -204,70 +214,55 @@ struct ExtConfig {
 } __attribute__((packed));
 
 // =============================================================================
-//  MQTT Config
+//  Timezone Rule Table
 // =============================================================================
-#define MQTT_DEFAULT_PORT        1883
-#define MQTT_DEFAULT_KEEPALIVE   60
-#define MQTT_RECONNECT_INTERVAL  10000UL
-#define MQTT_MAX_TOPIC_LEN       160
-#define MQTT_MAX_PAYLOAD_LEN     2048
-#define MQTT_PUBLISH_INTERVAL_DEFAULT 5
-struct MQTTConfig {
-    uint8_t  magic;
-    uint8_t  enabled;
-    char     broker[64];
-    uint16_t port;
-    char     username[32];
-    char     password[32];
-    char     client_id[32];
-    char     base_topic[48];
-    uint8_t  publish_interval;
-    uint8_t  retain_states;
-    uint8_t  qos;
-    uint8_t  home_assistant;
-    char     ha_prefix[24];
-    uint8_t  reserved[16];
-} __attribute__((packed));
-MQTTConfig  mqttConfig;
-
-// =============================================================================
-//  Dual-mode MQTT client
-// =============================================================================
-class DualModeMQTTClient : public WiFiClient {
-public:
-    WiFiClient       plainClient;
-    WiFiClientSecure secureClient;
-    bool             useTLS = false;
-    int connect(IPAddress ip, uint16_t port) override {
-        return useTLS ? secureClient.connect(ip, port) : plainClient.connect(ip, port);
-    }
-    int connect(const char* host, uint16_t port) override {
-        return useTLS ? secureClient.connect(host, port) : plainClient.connect(host, port);
-    }
-    size_t write(uint8_t b) override { return useTLS ? secureClient.write(b) : plainClient.write(b); }
-    size_t write(const uint8_t* buf, size_t size) override {
-        return useTLS ? secureClient.write(buf, size) : plainClient.write(buf, size);
-    }
-    int available() override { return useTLS ? secureClient.available() : plainClient.available(); }
-    int read() override { return useTLS ? secureClient.read() : plainClient.read(); }
-    int read(uint8_t* buf, size_t size) override {
-        return useTLS ? secureClient.read(buf, size) : plainClient.read(buf, size);
-    }
-    int peek() override { return useTLS ? secureClient.peek() : plainClient.peek(); }
-    void flush() override { useTLS ? secureClient.flush() : plainClient.flush(); }
-    void stop() override { useTLS ? secureClient.stop() : plainClient.stop(); }
-    uint8_t connected() override { return useTLS ? secureClient.connected() : plainClient.connected(); }
-    operator bool() override { return useTLS ? (bool)secureClient : (bool)plainClient; }
-    void setInsecure() { secureClient.setInsecure(); }
+struct TZRule {
+    const char* name;
+    int32_t     std_offset;
+    int32_t     dst_offset;
+    uint8_t     dst_start_mon;
+    uint8_t     dst_start_wday;
+    uint8_t     dst_start_nth;
+    uint8_t     dst_start_mday;
+    uint8_t     dst_start_hour;
+    uint8_t     dst_start_min;
+    uint8_t     dst_end_mon;
+    uint8_t     dst_end_wday;
+    uint8_t     dst_end_nth;
+    uint8_t     dst_end_mday;
+    uint8_t     dst_end_hour;
+    uint8_t     dst_end_min;
 };
-DualModeMQTTClient mqttWiFiClient;
-PubSubClient mqttClient(mqttWiFiClient);
-static bool          mqttConnected = false;
-static unsigned long lastMQTTReconnect = 0;
-static unsigned long lastMQTTPublish = 0;
-static bool          mqttPublishPending = false;
-static int8_t        mqttPendingRelay = -1;
-static uint8_t       mqttRetryCount = 0;
+
+static const TZRule TZ_TABLE[] = {
+    {"UTC",                       0,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Manila",           28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Tokyo",            32400,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Shanghai",         28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Kolkata",          19800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Dubai",            14400,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Singapore",        28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Hong_Kong",        28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Seoul",            32400,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Asia/Bangkok",          25200,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Australia/Sydney",      36000,   39600,    10,  0,    1,   0,  2, 0,    4,  0,    1,   0,  3, 0},
+    {"Australia/Perth",       28800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Australia/Brisbane",    36000,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Europe/London",             0,    3600,     3,  0, 0xFE,   0,  1, 0,   10,  0, 0xFE,   0,  2, 0},
+    {"Europe/Paris",           3600,    7200,     3,  0, 0xFE,   0,  2, 0,   10,  0, 0xFE,   0,  3, 0},
+    {"Europe/Berlin",          3600,    7200,     3,  0, 0xFE,   0,  2, 0,   10,  0, 0xFE,   0,  3, 0},
+    {"Europe/Moscow",         10800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"America/New_York",     -18000,  -14400,     3,  0,    2,   0,  2, 0,   11,  0,    1,   0,  2, 0},
+    {"America/Chicago",      -21600,  -18000,     3,  0,    2,   0,  2, 0,   11,  0,    1,   0,  2, 0},
+    {"America/Denver",       -25200,  -21600,     3,  0,    2,   0,  2, 0,   11,  0,    1,   0,  2, 0},
+    {"America/Los_Angeles",  -28800,  -25200,     3,  0,    2,   0,  2, 0,   11,  0,    1,   0,  2, 0},
+    {"America/Sao_Paulo",    -10800,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Pacific/Auckland",      43200,   46800,     9,  0, 0xFE,   0,  2, 0,    4,  0,    1,   0,  3, 0},
+    {"Pacific/Honolulu",     -36000,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+    {"Africa/Cairo",           7200,   10800,     4,  5, 0xFE,   0,  0, 0,   10,  4, 0xFE,   0, 24, 0},
+    {"Africa/Johannesburg",    7200,       0,     0,  0, 0xFF,   0,  0, 0,    0,  0, 0xFF,   0,  0, 0},
+};
+static const uint8_t TZ_TABLE_SIZE = sizeof(TZ_TABLE) / sizeof(TZ_TABLE[0]);
 
 // =============================================================================
 //  Self-Healing
@@ -284,16 +279,90 @@ SystemConfig sysConfig;
 ExtConfig    extConfig;
 RelayConfig  relayConfigs[MAX_RELAYS];
 HealthMetrics health;
+
+// =============================================================================
+//  MQTT Configuration / Runtime
+// =============================================================================
+#define MQTT_CONFIG_MAGIC 0x4D51
+#define MQTT_CONFIG_VERSION 1
+#define MQTT_HOST_LENGTH 96
+#define MQTT_CLIENT_ID_LENGTH 49
+#define MQTT_USER_LENGTH 64
+#define MQTT_PASSWORD_LENGTH 64
+#define MQTT_TOPIC_LENGTH 96
+#define MQTT_DISCOVERY_PREFIX_LENGTH 48
+#define MQTT_PACKET_BUFFER_SIZE 3072
+#define MQTT_COMMAND_MAX_LENGTH 255
+#define MQTT_RECONNECT_MIN_SECONDS 2
+#define MQTT_RECONNECT_MAX_SECONDS 300
+
+struct MQTTConfig {
+    uint16_t magic;
+    uint8_t version;
+    uint8_t enabled;
+    uint16_t port;
+    uint16_t keepAliveSec;
+    uint16_t reconnectIntervalSec;
+    uint16_t telemetryIntervalSec;
+    uint8_t retainStates;
+    uint8_t commandQoS;
+    uint8_t willQoS;
+    uint8_t haDiscovery;
+    char brokerHost[MQTT_HOST_LENGTH];
+    char clientId[MQTT_CLIENT_ID_LENGTH];
+    char username[MQTT_USER_LENGTH];
+    char password[MQTT_PASSWORD_LENGTH];
+    char baseTopic[MQTT_TOPIC_LENGTH];
+    char discoveryPrefix[MQTT_DISCOVERY_PREFIX_LENGTH];
+};
+
+MQTTConfig mqttConfig;
+WiFiClient mqttNetworkClient;
+PubSubClient mqttClient(mqttNetworkClient);
+static char mqttHardwareId[40] = "";
+static bool mqttWasConnected = false;
+static bool mqttStateDirty = true;
+static bool mqttDiscoveryDirty = true;
+static bool mqttSubscriptionsDirty = true;
+static bool mqttAvailabilityPending = true;
+static bool mqttRetainedLayoutCleanupPending = true;
+static bool mqttSubscriptionsReady = false;
+static bool mqttCommandResponsePending = false;
+static bool mqttTelemetryPending = true;
+static uint8_t mqttSubscribeFailures = 0;
+static unsigned long mqttLastAttemptAt = 0;
+static unsigned long mqttLastConnectAt = 0;
+static unsigned long mqttLastPublishAttemptAt = 0;
+static unsigned long mqttNextReconnectAt = 0;
+static unsigned long mqttNextSubscribeAt = 0;
+static unsigned long mqttNextDiscoveryAt = 0;
+static unsigned long mqttNextTelemetryAt = 0;
+static unsigned long mqttNextCommandResponseAt = 0;
+static unsigned long mqttNextAvailabilityAt = 0;
+static uint32_t mqttReconnectCount = 0;
+static uint32_t mqttPublishedCount = 0;
+static uint32_t mqttReceivedCount = 0;
+static int mqttLastStateCode = -1;
+static char mqttLastError[96] = "MQTT is disabled";
+static char mqttPendingCommandResponse[320] = "";
+
+// RTC
 uint64_t      internalEpoch            = 0;
 float         driftCompensation        = 1.0f;
 bool          rtcInitialized           = false;
 unsigned long rtcMicrosAtLastSync      = 0;
 unsigned long lastRTCRebase            = 0;
+
+// RTC Auto-Save
 static unsigned long lastInternalRTCSave = 0;
 static const unsigned long INTERNAL_RTC_SAVE_INTERVAL = 3600000UL;
+
+// NTP
 uint8_t       ntpFailCount    = 0;
 unsigned long lastNTPSync     = 0;
 unsigned long lastNTPAttempt  = 0;
+
+// NTP Async
 static uint8_t  ntpAsyncState = NTP_STATE_IDLE;
 static unsigned long ntpAsyncPhaseStart = 0;
 static WiFiUDP  ntpUDP;
@@ -302,6 +371,8 @@ static bool     ntpReceived = false;
 static uint64_t ntpResult = 0;
 static uint8_t  ntpRetryCount = 0;
 static uint8_t  ntpAsyncStage = 0;
+
+// WiFi
 bool          wifiConnected         = false;
 unsigned long lastWiFiCheck         = 0;
 uint8_t       wifiReconnectAttempts = 0;
@@ -309,11 +380,19 @@ unsigned long wifiGiveUpUntil       = 0;
 static const uint8_t MAX_RECONNECT  = 10;
 bool          wifiConnecting        = false;
 unsigned long wifiConnectStart      = 0;
+
+// WiFi Scan
 volatile bool scanInProgress  = false;
 volatile int  scanResultCount = -1;
 unsigned long scanStartTime   = 0;
+
+// mDNS
 bool          mdnsStarted           = false;
 char          mdnsHostname[32]      = MDNS_HOSTNAME_DEFAULT;
+
+// =============================================================================
+//  Schedule Engine
+// =============================================================================
 static bool     scheduleActiveCache[MAX_RELAYS] = {false};
 static unsigned long lastScheduleCacheUpdate = 0;
 static const unsigned long SCHEDULE_CACHE_INTERVAL = 250UL;
@@ -321,8 +400,19 @@ static unsigned long lastScheduleProcess = 0;
 static bool lastRelayOutputs[MAX_RELAYS] = {false};
 static unsigned long lastStateChangeGlobal[MAX_RELAYS] = {0};
 static bool lastDebouncedStateGlobal[MAX_RELAYS] = {false};
+
+// =============================================================================
+//  Memory Management
+// =============================================================================
 static unsigned long lastMemoryCleanup = 0;
 static unsigned long lastHeapCheck = 0;
+
+// =============================================================================
+//  DST Cache
+// =============================================================================
+static int32_t  cachedDstOffset = 0;
+static uint64_t cachedDstForEpoch = 0;
+static bool     cachedDstValid = false;
 
 // =============================================================================
 //  Self-Healing Class
@@ -336,7 +426,7 @@ public:
     void smartRecovery();
     void verifyRelayStates(bool force = false);
     void performTargetedRecovery();
-    void restartAPIfNeeded(bool forceRestart = false);
+    void restartAPIfNeeded(bool forceRestart);
 private:
     unsigned long lastFullHealthCheck = 0;
     unsigned long lastWiFiReconfigure = 0;
@@ -354,9 +444,14 @@ void loadConfiguration();
 void saveConfiguration();
 void loadExtConfig();
 void saveExtConfig();
-void loadMQTTConfig();
-void saveMQTTConfig();
-void syncInternalRTC(uint64_t rawUtcEpoch, uint8_t source = TIME_SOURCE_NTP);
+void loadMqttConfig();
+void mqttInitialize();
+void mqttService();
+void mqttPrepareFactoryReset();
+void mqttMarkDiscoveryDirty();
+static void mqttMarkStateDirty();
+void handleGetRelayStates();
+void syncInternalRTC(uint64_t rawUtcEpoch, uint8_t source);
 void updateScheduleCache();
 void autoSaveInternalRTC();
 void setupWebServer();
@@ -385,9 +480,6 @@ void handleAddGPIO();
 void handleDeleteGPIO();
 void handleToggleActiveLow();
 void handleGlobalActiveMode();
-void handleGetMQTT();
-void handleSaveMQTT();
-void handleToggleMQTT();
 void performMemoryCleanup();
 void cleanupStaleResources();
 void immediateDS3231Sync();
@@ -398,17 +490,9 @@ void startNTPRequest(const char* server);
 void processNTPResponse();
 void updateNTPSync();
 float getRTCTemperature();
-String getMDNSHostname();
-void buildMQTTTopic(char* buf, size_t len, const char* suffix);
-void buildRelayTopic(char* buf, size_t len, int relay, const char* suffix);
-void mqttConnect();
-void mqttDisconnect();
-void mqttLoop();
-void mqttCallback(char* topic, byte* payload, unsigned int length);
-void publishRelayState(int relayIdx);
-void publishAllRelayStates();
-void publishSystemState();
-void publishHomeAssistantDiscovery();
+void invalidateDstCache();
+int32_t currentDstOffset(uint64_t utcEpoch);
+uint8_t findTzByName(const char* name);
 
 // =============================================================================
 //  64-bit Conversion Helpers
@@ -427,9 +511,15 @@ struct tm* gmtime64(uint64_t* timep) {
     static struct tm tm;
     uint64_t t = *timep;
     if (t == 0) {
-        tm.tm_sec = 0; tm.tm_min = 0; tm.tm_hour = 0;
-        tm.tm_mday = 1; tm.tm_mon = 0; tm.tm_year = 70;
-        tm.tm_wday = 4; tm.tm_yday = 0; tm.tm_isdst = 0;
+        tm.tm_sec = 0;
+        tm.tm_min = 0;
+        tm.tm_hour = 0;
+        tm.tm_mday = 1;
+        tm.tm_mon = 0;
+        tm.tm_year = 70;
+        tm.tm_wday = 4;
+        tm.tm_yday = 0;
+        tm.tm_isdst = 0;
         return &tm;
     }
     uint64_t days = t / 86400ULL;
@@ -446,49 +536,176 @@ struct tm* gmtime64(uint64_t* timep) {
     uint64_t doy = doe - (365ULL * yoe + yoe / 4ULL - yoe / 100ULL);
     uint64_t mp = (5ULL * doy + 2ULL) / 153ULL;
     uint64_t d = doy - (153ULL * mp + 2ULL) / 5ULL + 1ULL;
-    uint64_t m = mp + (mp < 10ULL ? 3ULL : (uint64_t)-9);
+    uint64_t m = mp + (mp < 10ULL ? 3ULL : -9ULL);
     y += (m <= 2ULL ? 1ULL : 0ULL);
     tm.tm_mday = (int)d;
     tm.tm_mon = (int)(m - 1);
     tm.tm_year = (int)(y - 1900ULL);
     tm.tm_wday = (int)((days + 4ULL) % 7ULL);
     {
-        int leap = ((y % 4ULL == 0ULL) && (y % 100ULL != 0ULL)) || (y % 400ULL == 0ULL);
-        tm.tm_yday = (m <= 2ULL) ? (int)(doy - 306ULL) : (int)(doy + 59ULL + (leap ? 1ULL : 0ULL));
+        uint64_t isLeap = ((y % 4ULL == 0) && (y % 100ULL != 0)) || (y % 400ULL == 0);
+        tm.tm_yday = (m <= 2ULL) ? (int)(doy - 306ULL)
+                                 : (int)(doy + (isLeap ? 60ULL : 59ULL));
     }
     tm.tm_isdst = 0;
     return &tm;
 }
 
 // =============================================================================
-//  Helpers
+//  Timezone Helpers
+// =============================================================================
+static uint64_t daysFromYMD(uint16_t y, uint8_t m, uint8_t d) {
+    if (m <= 2) { y -= 1; m += 12; }
+    uint64_t era = y / 400;
+    uint64_t yoe = y - era * 400;
+    uint64_t doy = (153ULL * (m - 3) + 2) / 5 + d - 1;
+    uint64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static uint8_t nthWeekdayOfMonth(uint16_t year, uint8_t mon0, uint8_t wday, uint8_t nth) {
+    static const uint8_t t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+    uint16_t y = year;
+    if (mon0 < 2) y -= 1;
+    uint8_t wday1 = (uint8_t)((y + y/4 - y/100 + y/400 + t[mon0] + 1) % 7);
+    uint8_t first = (uint8_t)(((wday - wday1 + 7) % 7) + 1);
+    if (nth == 0xFE) {
+        static const uint8_t mdays[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        uint8_t dim = mdays[mon0];
+        bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+        if (mon0 == 1 && leap) dim = 29;
+        uint8_t d = first;
+        while (d + 7 <= dim) d += 7;
+        return d;
+    }
+    uint8_t d = first + (nth - 1) * 7;
+    static const uint8_t mdays2[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    uint8_t dim2 = mdays2[mon0];
+    bool leap2 = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    if (mon0 == 1 && leap2) dim2 = 29;
+    if (d > dim2) d -= 7;
+    return d;
+}
+
+static int32_t computeDstOffset(uint64_t utcEpoch, uint8_t ruleId) {
+    if (ruleId >= TZ_TABLE_SIZE) return 0;
+    const TZRule& r = TZ_TABLE[ruleId];
+    if (r.dst_offset == 0) return 0;
+
+    uint64_t localForStd = utcEpoch + (uint64_t)(int64_t)r.std_offset;
+    struct tm* p = gmtime64(&localForStd);
+    if (!p) return 0;
+    uint16_t year = (uint16_t)(p->tm_year + 1900);
+
+    uint8_t startDay = (r.dst_start_nth == 0xFF)
+        ? r.dst_start_mday
+        : nthWeekdayOfMonth(year, r.dst_start_mon - 1, r.dst_start_wday, r.dst_start_nth);
+    uint64_t startLocal = daysFromYMD(year, r.dst_start_mon, startDay) * 86400ULL
+                        + (uint64_t)r.dst_start_hour * 3600ULL
+                        + (uint64_t)r.dst_start_min * 60ULL;
+    uint64_t startUtc = startLocal - (uint64_t)(int64_t)r.std_offset;
+
+    uint8_t endDay = (r.dst_end_nth == 0xFF)
+        ? r.dst_end_mday
+        : nthWeekdayOfMonth(year, r.dst_end_mon - 1, r.dst_end_wday, r.dst_end_nth);
+    uint64_t endLocal = daysFromYMD(year, r.dst_end_mon, endDay) * 86400ULL
+                      + (uint64_t)r.dst_end_hour * 3600ULL
+                      + (uint64_t)r.dst_end_min * 60ULL;
+    uint64_t endUtc = endLocal - (uint64_t)(int64_t)r.dst_offset;
+
+    bool inDst;
+    if (startUtc < endUtc) {
+        inDst = (utcEpoch >= startUtc && utcEpoch < endUtc);
+    } else {
+        inDst = (utcEpoch >= startUtc || utcEpoch < endUtc);
+    }
+    return inDst ? (r.dst_offset - r.std_offset) : 0;
+}
+
+uint8_t findTzByName(const char* name) {
+    if (!name) return 0;
+    for (uint8_t i = 0; i < TZ_TABLE_SIZE; i++) {
+        if (strcmp(TZ_TABLE[i].name, name) == 0) return i;
+    }
+    return TZ_TABLE_SIZE;
+}
+
+void invalidateDstCache() {
+    cachedDstValid = false;
+}
+
+int32_t currentDstOffset(uint64_t utcEpoch) {
+    if (cachedDstValid && utcEpoch >= cachedDstForEpoch
+        && (utcEpoch - cachedDstForEpoch) < DST_CACHE_TTL_SECONDS) {
+        return cachedDstOffset;
+    }
+    int32_t off = 0;
+    if (sysConfig.tz_auto_dst && sysConfig.tz_rule_id < TZ_TABLE_SIZE) {
+        off = computeDstOffset(utcEpoch, sysConfig.tz_rule_id);
+    } else {
+        off = sysConfig.daylight_offset;
+    }
+    cachedDstOffset = off;
+    cachedDstForEpoch = utcEpoch;
+    cachedDstValid = true;
+    return off;
+}
+
+// =============================================================================
+//  Get Local Epoch
 // =============================================================================
 inline uint64_t getLocalEpoch(uint64_t utcEpoch) {
-    int64_t offset = (int64_t)sysConfig.gmt_offset + (int64_t)sysConfig.daylight_offset;
+    int64_t offset;
+    if (sysConfig.tz_auto_dst && sysConfig.tz_rule_id < TZ_TABLE_SIZE) {
+        const TZRule& r = TZ_TABLE[sysConfig.tz_rule_id];
+        offset = (int64_t)r.std_offset + (int64_t)currentDstOffset(utcEpoch);
+    } else {
+        offset = (int64_t)sysConfig.gmt_offset + (int64_t)sysConfig.daylight_offset;
+    }
     if (offset > 50400) offset = 50400;
     if (offset < -50400) offset = -50400;
     return utcEpoch + (uint64_t)offset;
 }
+
+// =============================================================================
+//  Get Active Low Setting For Relays
+// =============================================================================
 inline bool isActiveLow(uint8_t index) {
     if (index < gpioConfig.count) {
-        if (extConfig.global_active_mode == 1) return true;
-        if (extConfig.global_active_mode == 2) return false;
+        if (extConfig.global_active_mode == 1) {
+            return true;
+        } else if (extConfig.global_active_mode == 2) {
+            return false;
+        }
         return gpioConfig.activeLow[index];
     }
     return true;
 }
+
+// =============================================================================
+//  Inline Helpers
+// =============================================================================
 inline unsigned long getNTPInterval() {
     uint8_t h = extConfig.ntp_sync_hours;
     if (h < 1 || h > 24) h = 1;
     return (unsigned long)h * 3600000UL;
 }
 inline int getRelayPin(uint8_t index) {
-    if (index < gpioConfig.count) return gpioConfig.pins[index];
+    if (index < gpioConfig.count) {
+        return gpioConfig.pins[index];
+    }
     return -1;
 }
+
+// =============================================================================
+//  Set Relay Output with Active Low Consideration
+// =============================================================================
 inline void setRelayOutput(uint8_t index, bool state) {
     int pin = getRelayPin(index);
-    if (pin >= 0) digitalWrite(pin, isActiveLow(index) ? !state : state);
+    if (pin >= 0) {
+        digitalWrite(pin, isActiveLow(index) ? !state : state);
+        mqttMarkStateDirty();
+    }
 }
 
 // =============================================================================
@@ -498,7 +715,7 @@ void initScheduleDefaults(int relayIndex) {
     memset(&relayConfigs[relayIndex], 0, sizeof(RelayConfig));
     for (int s = 0; s < 8; s++) {
         relayConfigs[relayIndex].schedule.days[s] = DAY_ALL;
-        relayConfigs[relayIndex].schedule.monthDays[s] = 0x7FFFFFFFUL; 
+        relayConfigs[relayIndex].schedule.monthDays[s] = 0x7FFFFFFFUL;
         relayConfigs[relayIndex].schedule.monthMask[s] = MONTH_ALL;
     }
     snprintf(relayConfigs[relayIndex].name, 16, "Relay %d", relayIndex + 1);
@@ -519,13 +736,16 @@ void setWiFiStationEnabled(bool enabled) {
         wifiPausedForScan = false;
         wifiReconnectAttempts = 0;
         wifiGiveUpUntil = 0;
-        if (WiFi.getMode() != WIFI_AP) WiFi.mode(WIFI_AP);
+        if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
+            WiFi.mode(WIFI_AP_STA);
+        }
         ntpAsyncState = NTP_STATE_IDLE;
         ntpAsyncStage = 0;
         lastNTPSync = 0;
-        mqttDisconnect();
     } else {
-        if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+        if (WiFi.getMode() != WIFI_AP_STA) {
+            WiFi.mode(WIFI_AP_STA);
+        }
         if (strlen(sysConfig.sta_ssid) > 0) {
             WiFi.begin(sysConfig.sta_ssid, sysConfig.sta_password);
             wifiConnecting = true;
@@ -592,7 +812,9 @@ float getRTCTemperature() {
     Wire.beginTransmission(0x68);
     Wire.write(0x11);
     if (Wire.endTransmission() != 0) return cachedRtcTemp;
-    if (Wire.requestFrom((uint8_t)0x68, (uint8_t)2) != 2) return cachedRtcTemp;
+    if (Wire.requestFrom((uint8_t)0x68, (uint8_t)2) != 2) {
+        return cachedRtcTemp;
+    }
     int8_t  msb = (int8_t)Wire.read();
     uint8_t lsb = Wire.read();
     cachedRtcTemp = (float)msb + ((lsb >> 6) * 0.25f);
@@ -630,11 +852,12 @@ void performRTCReabase() {
 
 uint64_t getCurrentEpoch() {
     if (rtcInitialized && internalEpoch > 0) {
+        unsigned long currentMicros = micros();
         unsigned long currentMillis = millis();
         if (lastRTCRebase == 0 || timeHasElapsed(currentMillis, lastRTCRebase, RTC_REBASE_INTERVAL)) {
             performRTCReabase();
+            currentMicros = micros();
         }
-        unsigned long currentMicros = micros();
         unsigned long elapsedMicros;
         if (currentMicros >= rtcMicrosAtLastSync) {
             elapsedMicros = currentMicros - rtcMicrosAtLastSync;
@@ -655,7 +878,9 @@ uint64_t getCurrentEpoch() {
         DateTime now = rtc.now();
         if (now.year() >= 2020 && now.year() <= 2100) {
             uint64_t rtcEpoch = rtcDateTimeToUint64(now);
-            if (VALID_UNIX_TIME_64(rtcEpoch)) return rtcEpoch;
+            if (VALID_UNIX_TIME_64(rtcEpoch)) {
+                return rtcEpoch;
+            }
         }
     }
     return 0;
@@ -771,13 +996,13 @@ bool SelfHealingSystem::liveReconfigureMDNS() {
             MDNS.addServiceTxt("http", "tcp", "model", "ESP32S3");
             MDNS.addServiceTxt("http", "tcp", "version", "v12");
             MDNS.addServiceTxt("http", "tcp", "channels", String(gpioConfig.count).c_str());
-            MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit,mqtt");
+            MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit");
             mdnsStarted = true;
         }
     } else {
         MDNS.addService("http", "tcp", 80);
         MDNS.addServiceTxt("http", "tcp", "channels", String(gpioConfig.count).c_str());
-        MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit,mqtt");
+        MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit");
     }
     lastMDNSReconfigure = now;
     return mdnsStarted;
@@ -794,7 +1019,9 @@ bool SelfHealingSystem::liveReconfigureAP() {
         } else {
             ok = WiFi.softAP(sysConfig.ap_ssid, NULL, ch, hidden);
         }
-        if (ok) liveReconfigureMDNS();
+        if (ok) {
+            liveReconfigureMDNS();
+        }
         return ok;
     }
     return true;
@@ -818,6 +1045,28 @@ void SelfHealingSystem::restartAPIfNeeded(bool forceRestart) {
         }
         if (apStarted) {
             delay(100);
+            dnsServer.stop();
+            dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+            if (mdnsStarted) {
+                MDNS.end();
+                mdnsStarted = false;
+            }
+            lastMDNSReconfigure = millis() - 60000UL;
+            liveReconfigureMDNS();
+        } else {
+            if (strlen(sysConfig.ap_password) > 0) {
+                WiFi.softAP(sysConfig.ap_ssid, sysConfig.ap_password, 6, hidden);
+            } else {
+                WiFi.softAP(sysConfig.ap_ssid, NULL, 6, hidden);
+            }
+            delay(100);
+            dnsServer.stop();
+            dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+            if (mdnsStarted) {
+                MDNS.end();
+                mdnsStarted = false;
+            }
+            lastMDNSReconfigure = millis() - 60000UL;
             liveReconfigureMDNS();
         }
     }
@@ -923,18 +1172,22 @@ void SelfHealingSystem::smartRecovery() {
     liveReconfigureAP();
 }
 
+// =============================================================================
+//  Memory Management
+// =============================================================================
 void performMemoryCleanup() {
     if (!scanInProgress) {
-        int sc = WiFi.scanComplete();
-        if (sc != WIFI_SCAN_RUNNING && sc >= 0) WiFi.scanDelete();
+        WiFi.scanDelete();
     }
-    for (int i = 0; i < 10; i++) { yield(); delay(1); }
+    for (int i = 0; i < 10; i++) {
+        yield();
+        delay(1);
+    }
 }
 
 void cleanupStaleResources() {
-    if (!scanInProgress) {
-        int sc = WiFi.scanComplete();
-        if (sc != WIFI_SCAN_RUNNING && sc >= 0) WiFi.scanDelete();
+    if (!scanInProgress && WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
+        WiFi.scanDelete();
     }
     performMemoryCleanup();
 }
@@ -944,557 +1197,13 @@ void checkAndCleanMemory() {
     if (timeHasElapsed(now, lastHeapCheck, 300000)) {
         lastHeapCheck = now;
         size_t freeHeap = ESP.getFreeHeap();
-        if (freeHeap < 20000) performMemoryCleanup();
+        if (freeHeap < 20000) {
+            performMemoryCleanup();
+        }
     }
     if (timeHasElapsed(now, lastMemoryCleanup, 3600000)) {
         lastMemoryCleanup = now;
         performMemoryCleanup();
-    }
-}
-
-// =============================================================================
-//  MQTT Core Functions
-// =============================================================================
-inline void buildMQTTTopic(char* buf, size_t len, const char* suffix) {
-    snprintf(buf, len, "%s/%s", mqttConfig.base_topic, suffix);
-}
-inline void buildRelayTopic(char* buf, size_t len, int relay, const char* suffix) {
-    snprintf(buf, len, "%s/relay/%d/%s", mqttConfig.base_topic, relay + 1, suffix);
-}
-
-void loadMQTTConfig() {
-    preferences.begin(NVS_NAMESPACE, true);
-    size_t len = preferences.getBytes("mqttConfig", &mqttConfig, sizeof(MQTTConfig));
-    preferences.end();
-    bool valid = (len == sizeof(MQTTConfig)) && (mqttConfig.magic == MQTT_CFG_MAGIC);
-    if (!valid) {
-        memset(&mqttConfig, 0, sizeof(MQTTConfig));
-        mqttConfig.magic = MQTT_CFG_MAGIC;
-        mqttConfig.enabled = 0;
-        mqttConfig.port = MQTT_DEFAULT_PORT;
-        strcpy(mqttConfig.client_id, "esp32s3_relay16");
-        strcpy(mqttConfig.base_topic, "esp32s3/relay16");
-        strcpy(mqttConfig.ha_prefix, "homeassistant");
-        mqttConfig.publish_interval = MQTT_PUBLISH_INTERVAL_DEFAULT;
-        mqttConfig.retain_states = 1;
-        mqttConfig.qos = 0;
-        mqttConfig.home_assistant = 0;
-        saveMQTTConfig();
-    }
-    if (mqttConfig.publish_interval < 1) mqttConfig.publish_interval = 5;
-    if (mqttConfig.publish_interval > 60) mqttConfig.publish_interval = 60;
-    if (mqttConfig.qos > 1) mqttConfig.qos = 0;
-    if (mqttConfig.port == 0) mqttConfig.port = MQTT_DEFAULT_PORT;
-    if (strlen(mqttConfig.base_topic) == 0) strcpy(mqttConfig.base_topic, "esp32s3/relay16");
-    if (strlen(mqttConfig.client_id) == 0) strcpy(mqttConfig.client_id, "esp32s3_relay16");
-    if (strlen(mqttConfig.ha_prefix) == 0) strcpy(mqttConfig.ha_prefix, "homeassistant");
-}
-
-void saveMQTTConfig() {
-    preferences.begin(NVS_NAMESPACE, false);
-    preferences.putBytes("mqttConfig", &mqttConfig, sizeof(MQTTConfig));
-    preferences.end();
-}
-
-void mqttConnect() {
-    if (!mqttConfig.enabled) return;
-    if (!wifiConnected || WiFi.status() != WL_CONNECTED) return;
-    if (mqttClient.connected()) return;
-    if (strlen(mqttConfig.broker) == 0) return;
-    unsigned long now = millis();
-    unsigned long backoff = MQTT_RECONNECT_INTERVAL;
-    if (mqttRetryCount > 0) {
-        uint8_t shift = (mqttRetryCount > 4) ? 4 : mqttRetryCount;
-        backoff = MQTT_RECONNECT_INTERVAL * (1UL << shift);
-        if (backoff > 120000UL) backoff = 120000UL;
-    }
-    if (lastMQTTReconnect != 0 && !timeHasElapsed(now, lastMQTTReconnect, backoff)) return;
-    lastMQTTReconnect = now;
-    mqttWiFiClient.useTLS = (mqttConfig.port == 8883);
-    if (mqttWiFiClient.useTLS) mqttWiFiClient.setInsecure();
-    mqttClient.setServer(mqttConfig.broker, mqttConfig.port);
-    mqttClient.setKeepAlive(MQTT_DEFAULT_KEEPALIVE);
-    mqttClient.setBufferSize(MQTT_MAX_PAYLOAD_LEN);
-    mqttClient.setCallback(mqttCallback);
-    char willTopic[MQTT_MAX_TOPIC_LEN];
-    buildMQTTTopic(willTopic, sizeof(willTopic), "status");
-    bool connected = false;
-    if (strlen(mqttConfig.username) > 0) {
-        connected = mqttClient.connect(
-            mqttConfig.client_id,
-            mqttConfig.username, mqttConfig.password,
-            willTopic, 0, true, "offline"
-        );
-    } else {
-        connected = mqttClient.connect(
-            mqttConfig.client_id,
-            willTopic, 0, true, "offline"
-        );
-    }
-    if (connected) {
-        mqttConnected = true;
-        mqttRetryCount = 0;
-        mqttPublishPending = true;
-        mqttPendingRelay = -1;
-        mqttClient.publish(willTopic, "online", true);
-        char topic[MQTT_MAX_TOPIC_LEN];
-        snprintf(topic, sizeof(topic), "%s/relay/+/set", mqttConfig.base_topic);
-        mqttClient.subscribe(topic, mqttConfig.qos);
-        snprintf(topic, sizeof(topic), "%s/relay/+/toggle", mqttConfig.base_topic);
-        mqttClient.subscribe(topic, mqttConfig.qos);
-        snprintf(topic, sizeof(topic), "%s/relay/+/auto", mqttConfig.base_topic);
-        mqttClient.subscribe(topic, mqttConfig.qos);
-        snprintf(topic, sizeof(topic), "%s/all/set", mqttConfig.base_topic);
-        mqttClient.subscribe(topic, mqttConfig.qos);
-        snprintf(topic, sizeof(topic), "%s/system/+/set", mqttConfig.base_topic);
-        mqttClient.subscribe(topic, mqttConfig.qos);
-        snprintf(topic, sizeof(topic), "%s/system/status", mqttConfig.base_topic);
-        mqttClient.subscribe(topic, mqttConfig.qos);
-        snprintf(topic, sizeof(topic), "%s/schedule/+/set", mqttConfig.base_topic);
-        mqttClient.subscribe(topic, mqttConfig.qos);
-        snprintf(topic, sizeof(topic), "%s/time/sync", mqttConfig.base_topic);
-        mqttClient.subscribe(topic, mqttConfig.qos);
-        if (mqttConfig.home_assistant) {
-            publishHomeAssistantDiscovery();
-        }
-    } else {
-        mqttRetryCount++;
-    }
-}
-
-void mqttDisconnect() {
-    if (mqttClient.connected()) {
-        char topic[MQTT_MAX_TOPIC_LEN];
-        buildMQTTTopic(topic, sizeof(topic), "status");
-        mqttClient.publish(topic, "offline", true);
-        mqttClient.disconnect();
-    }
-    mqttConnected = false;
-}
-
-void mqttLoop() {
-    if (!mqttConfig.enabled) return;
-    if (!wifiConnected || WiFi.status() != WL_CONNECTED) {
-        if (mqttConnected || mqttClient.connected()) {
-            mqttClient.disconnect();
-            mqttConnected = false;
-        }
-        return;
-    }
-    if (!mqttClient.connected()) {
-        mqttConnected = false;
-        mqttConnect();
-        return;
-    }
-    mqttClient.loop();
-    mqttConnected = true;
-    mqttRetryCount = 0;
-    unsigned long now = millis();
-    if (mqttPublishPending) {
-        mqttPublishPending = false;
-        if (mqttPendingRelay >= 0) {
-            publishRelayState(mqttPendingRelay);
-            mqttPendingRelay = -1;
-        } else {
-            publishAllRelayStates();
-        }
-    }
-    unsigned long interval = (unsigned long)mqttConfig.publish_interval * 1000UL;
-    if (timeHasElapsed(now, lastMQTTPublish, interval)) {
-        lastMQTTPublish = now;
-        publishAllRelayStates();
-        publishSystemState();
-    }
-}
-
-// =============================================================================
-//  MQTT Callback
-// =============================================================================
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    char msg[MQTT_MAX_PAYLOAD_LEN];
-    if (length >= MQTT_MAX_PAYLOAD_LEN) length = MQTT_MAX_PAYLOAD_LEN - 1;
-    memcpy(msg, payload, length);
-    msg[length] = '\0';
-    String payloadStr = String(msg);
-    payloadStr.trim();
-    String payloadLower = payloadStr;
-    payloadLower.toLowerCase();
-    const char* baseTopic = mqttConfig.base_topic;
-    size_t baseLen = strlen(baseTopic);
-    if (strncmp(topic, baseTopic, baseLen) != 0 || topic[baseLen] != '/') return;
-    const char* relative = topic + baseLen + 1;
-    if (strncmp(relative, "relay/", 6) == 0) {
-        const char* rest = relative + 6;
-        const char* slash = strchr(rest, '/');
-        if (!slash) return;
-        int relayNum = atoi(rest);
-        const char* action = slash + 1;
-        if (relayNum < 1 || relayNum > gpioConfig.count) return;
-        int relayIdx = relayNum - 1;
-        if (strcmp(action, "set") == 0) {
-            bool state = false;
-            if (payloadLower == "1" || payloadLower == "on" || payloadLower == "true") state = true;
-            else if (payloadLower == "0" || payloadLower == "off" || payloadLower == "false") state = false;
-            else return;
-            relayConfigs[relayIdx].manualOverride = true;
-            relayConfigs[relayIdx].manualState = state;
-            scheduleActiveCache[relayIdx] = false;
-            setRelayOutput(relayIdx, state);
-            lastRelayOutputs[relayIdx] = state;
-            lastDebouncedStateGlobal[relayIdx] = state;
-            lastStateChangeGlobal[relayIdx] = millis();
-            saveConfiguration();
-            mqttPublishPending = true;
-            mqttPendingRelay = relayIdx;
-        } else if (strcmp(action, "toggle") == 0) {
-            bool newState = !lastRelayOutputs[relayIdx];
-            relayConfigs[relayIdx].manualOverride = true;
-            relayConfigs[relayIdx].manualState = newState;
-            scheduleActiveCache[relayIdx] = false;
-            setRelayOutput(relayIdx, newState);
-            lastRelayOutputs[relayIdx] = newState;
-            lastDebouncedStateGlobal[relayIdx] = newState;
-            lastStateChangeGlobal[relayIdx] = millis();
-            saveConfiguration();
-            mqttPublishPending = true;
-            mqttPendingRelay = relayIdx;
-        } else if (strcmp(action, "auto") == 0) {
-            relayConfigs[relayIdx].manualOverride = false;
-            updateScheduleCache();
-            saveConfiguration();
-            mqttPublishPending = true;
-            mqttPendingRelay = relayIdx;
-        }
-    }
-    else if (strcmp(relative, "all/set") == 0) {
-        bool state = false;
-        if (payloadLower == "1" || payloadLower == "on" || payloadLower == "true") state = true;
-        else if (payloadLower == "0" || payloadLower == "off" || payloadLower == "false") state = false;
-        else return;
-        for (int i = 0; i < gpioConfig.count; i++) {
-            relayConfigs[i].manualOverride = true;
-            relayConfigs[i].manualState = state;
-            scheduleActiveCache[i] = false;
-            setRelayOutput(i, state);
-            lastRelayOutputs[i] = state;
-            lastDebouncedStateGlobal[i] = state;
-            lastStateChangeGlobal[i] = millis();
-        }
-        saveConfiguration();
-        mqttPublishPending = true;
-        mqttPendingRelay = -1;
-    }
-    else if (strncmp(relative, "system/", 7) == 0) {
-        if (strcmp(relative, "system/status") == 0) {
-            mqttPublishPending = true;
-            mqttPendingRelay = -1;
-            return;
-        }
-        const char* cmdRest = relative + 7;
-        const char* cmdSlash = strchr(cmdRest, '/');
-        char cmd[32];
-        if (cmdSlash) {
-            size_t clen = cmdSlash - cmdRest;
-            if (clen >= sizeof(cmd)) clen = sizeof(cmd) - 1;
-            memcpy(cmd, cmdRest, clen);
-            cmd[clen] = '\0';
-        } else {
-            strncpy(cmd, cmdRest, sizeof(cmd) - 1);
-            cmd[sizeof(cmd) - 1] = '\0';
-        }
-        if (strcmp(cmd, "restart") == 0) {
-            if (payloadLower == "1" || payloadLower == "true") {
-                char respTopic[MQTT_MAX_TOPIC_LEN];
-                buildMQTTTopic(respTopic, sizeof(respTopic), "system/response");
-                mqttClient.publish(respTopic, "{\"action\":\"restart\",\"status\":\"ok\"}");
-                delay(500);
-                ESP.restart();
-            }
-        }
-        else if (strcmp(cmd, "factory_reset") == 0) {
-            if (payloadLower == "1" || payloadLower == "true") {
-                char respTopic[MQTT_MAX_TOPIC_LEN];
-                buildMQTTTopic(respTopic, sizeof(respTopic), "system/response");
-                mqttClient.publish(respTopic, "{\"action\":\"factory_reset\",\"status\":\"ok\"}");
-                delay(500);
-                preferences.begin(NVS_NAMESPACE, false);
-                preferences.clear();
-                preferences.end();
-                delay(100);
-                ESP.restart();
-            }
-        }
-        else if (strcmp(cmd, "verify") == 0) {
-            healer.performTargetedRecovery();
-            char respTopic[MQTT_MAX_TOPIC_LEN];
-            buildMQTTTopic(respTopic, sizeof(respTopic), "system/response");
-            mqttClient.publish(respTopic, "{\"action\":\"verify\",\"status\":\"ok\"}");
-        }
-    }
-    else if (strncmp(relative, "schedule/", 9) == 0) {
-        const char* rest = relative + 9;
-        const char* slash = strchr(rest, '/');
-        if (!slash) return;
-        int relayNum = atoi(rest);
-        if (relayNum < 1 || relayNum > gpioConfig.count) return;
-        StaticJsonDocument<512> doc;
-        DeserializationError err = deserializeJson(doc, msg);
-        if (err) return;
-        int relayIdx = relayNum - 1;
-        int slot = doc["slot"] | 0;
-        if (slot < 0 || slot > 7) return;
-        if (doc.containsKey("enabled"))
-            relayConfigs[relayIdx].schedule.enabled[slot] = doc["enabled"];
-        if (doc.containsKey("start")) {
-            const char* s = doc["start"];
-            int h, m, sec;
-            if (sscanf(s, "%d:%d:%d", &h, &m, &sec) == 3) {
-                if (h < 0 || h > 23) h = 0;
-                if (m < 0 || m > 59) m = 0;
-                if (sec < 0 || sec > 59) sec = 0;
-                relayConfigs[relayIdx].schedule.startHour[slot] = h;
-                relayConfigs[relayIdx].schedule.startMinute[slot] = m;
-                relayConfigs[relayIdx].schedule.startSecond[slot] = sec;
-            }
-        }
-        if (doc.containsKey("stop")) {
-            const char* s = doc["stop"];
-            int h, m, sec;
-            if (sscanf(s, "%d:%d:%d", &h, &m, &sec) == 3) {
-                if (h < 0 || h > 23) h = 0;
-                if (m < 0 || m > 59) m = 0;
-                if (sec < 0 || sec > 59) sec = 0;
-                relayConfigs[relayIdx].schedule.stopHour[slot] = h;
-                relayConfigs[relayIdx].schedule.stopMinute[slot] = m;
-                relayConfigs[relayIdx].schedule.stopSecond[slot] = sec;
-            }
-        }
-        if (doc.containsKey("days"))
-            relayConfigs[relayIdx].schedule.days[slot] = doc["days"].as<uint8_t>() & 0x7F;
-        if (doc.containsKey("monthDays")) {
-            uint32_t md = doc["monthDays"];
-            relayConfigs[relayIdx].schedule.monthDays[slot] = md & 0x7FFFFFFFUL;
-        }
-        if (doc.containsKey("monthMask")) {
-            relayConfigs[relayIdx].schedule.monthMask[slot] = doc["monthMask"].as<uint16_t>() & 0x0FFF;
-        }
-        saveConfiguration();
-        updateScheduleCache();
-        mqttPublishPending = true;
-        mqttPendingRelay = relayIdx;
-    }
-    else if (strcmp(relative, "time/sync") == 0) {
-        if (payloadLower == "ntp") {
-            lastNTPSync = 0;
-            lastNTPAttempt = 0;
-        } else {
-            uint64_t epoch = strtoull(msg, NULL, 10);
-            if (VALID_UNIX_TIME_64(epoch)) {
-                uint64_t currentEpoch = getCurrentEpoch();
-                bool trustCurrentTime = false;
-                unsigned long nowMs = millis();
-                if (timeSource == TIME_SOURCE_NTP && lastNTPSync > 0 &&
-                    !timeHasElapsed(nowMs, lastNTPSync, 86400000UL)) {
-                    trustCurrentTime = true;
-                }
-                if (timeSource == TIME_SOURCE_RTC && rtcPresent && rtcTimeValid &&
-                    lastRTCDSync > 0 &&
-                    !timeHasElapsed(nowMs, lastRTCDSync, 86400000UL)) {
-                    trustCurrentTime = true;
-                }
-                if (timeSource == TIME_SOURCE_BROWSER && lastBrowserSync > 0 &&
-                    !timeHasElapsed(nowMs, lastBrowserSync, 86400000UL)) {
-                    trustCurrentTime = true;
-                }
-                bool ok = true;
-                if (trustCurrentTime && currentEpoch >= MIN_UNIX_TIME_64) {
-                    uint64_t diff = (epoch > currentEpoch) ? (epoch - currentEpoch) : (currentEpoch - epoch);
-                    if (diff > 31536000ULL) ok = false;
-                }
-                if (ok) syncInternalRTC(epoch, TIME_SOURCE_BROWSER);
-            }
-        }
-    }
-}
-
-// =============================================================================
-//  MQTT Publishing
-// =============================================================================
-void publishRelayState(int relayIdx) {
-    if (!mqttConnected || !mqttClient.connected()) return;
-    if (relayIdx < 0 || relayIdx >= gpioConfig.count) return;
-    char topic[MQTT_MAX_TOPIC_LEN];
-    bool retain = mqttConfig.retain_states ? true : false;
-    buildRelayTopic(topic, sizeof(topic), relayIdx, "state");
-    const char* stateStr = lastRelayOutputs[relayIdx] ? "ON" : "OFF";
-    mqttClient.publish(topic, stateStr, retain);
-    buildRelayTopic(topic, sizeof(topic), relayIdx, "mode");
-    const char* modeStr = relayConfigs[relayIdx].manualOverride ? "manual" : "auto";
-    mqttClient.publish(topic, modeStr, retain);
-    buildRelayTopic(topic, sizeof(topic), relayIdx, "json");
-    DynamicJsonDocument doc(256);
-    doc["relay"] = relayIdx + 1;
-    doc["name"] = relayConfigs[relayIdx].name;
-    doc["state"] = lastRelayOutputs[relayIdx] ? "ON" : "OFF";
-    doc["manual"] = relayConfigs[relayIdx].manualOverride;
-    doc["pin"] = getRelayPin(relayIdx);
-    doc["activeLow"] = isActiveLow(relayIdx);
-    String json;
-    serializeJson(doc, json);
-    mqttClient.publish(topic, json.c_str(), retain);
-}
-
-void publishAllRelayStates() {
-    if (!mqttConnected || !mqttClient.connected()) return;
-    for (int i = 0; i < gpioConfig.count; i++) {
-        publishRelayState(i);
-        yield();
-    }
-    char topic[MQTT_MAX_TOPIC_LEN];
-    buildMQTTTopic(topic, sizeof(topic), "relays/json");
-    DynamicJsonDocument doc(4096);
-    doc["count"] = gpioConfig.count;
-    doc["timestamp"] = millis();
-    JsonArray arr = doc.createNestedArray("relays");
-    for (int i = 0; i < gpioConfig.count; i++) {
-        JsonObject r = arr.createNestedObject();
-        r["id"] = i + 1;
-        r["name"] = relayConfigs[i].name;
-        r["state"] = lastRelayOutputs[i] ? "ON" : "OFF";
-        r["manual"] = relayConfigs[i].manualOverride;
-        r["pin"] = getRelayPin(i);
-    }
-    size_t needed = measureJson(doc) + 1;
-    if (needed > MQTT_MAX_PAYLOAD_LEN) return;
-    String json;
-    serializeJson(doc, json);
-    mqttClient.publish(topic, json.c_str(), mqttConfig.retain_states);
-    bool allOn = gpioConfig.count > 0;
-    for (int i = 0; i < gpioConfig.count; i++) {
-        if (!lastRelayOutputs[i]) { allOn = false; break; }
-    }
-    char allStateTopic[MQTT_MAX_TOPIC_LEN];
-    buildMQTTTopic(allStateTopic, sizeof(allStateTopic), "all/state");
-    mqttClient.publish(allStateTopic, allOn ? "ON" : "OFF", mqttConfig.retain_states);
-}
-
-void publishSystemState() {
-    if (!mqttConnected || !mqttClient.connected()) return;
-    char topic[MQTT_MAX_TOPIC_LEN];
-    buildMQTTTopic(topic, sizeof(topic), "system/json");
-    DynamicJsonDocument doc(1024);
-    doc["version"] = EEPROM_VERSION;
-    doc["uptime"] = (uint64_t)(esp_timer_get_time() / 1000000ULL);
-    doc["freeHeap"] = ESP.getFreeHeap();
-    doc["wifi_connected"] = wifiConnected;
-    doc["wifi_ssid"] = sysConfig.sta_ssid;
-    doc["rssi"] = wifiConnected ? (int)WiFi.RSSI() : 0;
-    doc["ip"] = WiFi.localIP().toString();
-    doc["ap_ip"] = WiFi.softAPIP().toString();
-    uint64_t epoch = getCurrentEpoch();
-    char epochStr[32];
-    snprintf(epochStr, sizeof(epochStr), "%llu", (unsigned long long)epoch);
-    doc["utc_epoch"] = epochStr;
-    const char* tsrc = "none";
-    if (timeSource == TIME_SOURCE_NTP) tsrc = "ntp";
-    else if (timeSource == TIME_SOURCE_BROWSER) tsrc = "browser";
-    else if (timeSource == TIME_SOURCE_RTC) tsrc = "rtc";
-    doc["time_source"] = tsrc;
-    doc["rtc_present"] = rtcPresent;
-    float rtcTemp = getRTCTemperature();
-    if (!isnan(rtcTemp)) doc["rtc_temp"] = rtcTemp;
-    doc["relay_count"] = gpioConfig.count;
-    doc["mdns_hostname"] = getMDNSHostname();
-    String json;
-    serializeJson(doc, json);
-    mqttClient.publish(topic, json.c_str(), mqttConfig.retain_states);
-    buildMQTTTopic(topic, sizeof(topic), "status");
-    mqttClient.publish(topic, "online", true);
-}
-
-void publishHomeAssistantDiscovery() {
-    if (!mqttConnected || !mqttClient.connected()) return;
-    if (!mqttConfig.home_assistant) return;
-    char topic[MQTT_MAX_TOPIC_LEN];
-    char payload[MQTT_MAX_PAYLOAD_LEN];
-    char deviceJson[256];
-    int devLen = snprintf(deviceJson, sizeof(deviceJson),
-        "\"device\":{"
-            "\"identifiers\":[\"%s\"],"
-            "\"name\":\"ESP32S3 16CH Relay Timer\","
-            "\"model\":\"ESP32S3\","
-            "\"manufacturer\":\"Raff Alds\","
-            "\"sw_version\":\"v12\""
-        "}",
-        mqttConfig.client_id
-    );
-    if (devLen < 0 || devLen >= (int)sizeof(deviceJson)) return;
-    char availTopic[MQTT_MAX_TOPIC_LEN];
-    buildMQTTTopic(availTopic, sizeof(availTopic), "status");
-    for (int i = 0; i < gpioConfig.count; i++) {
-        char stateTopic[MQTT_MAX_TOPIC_LEN];
-        char cmdTopic[MQTT_MAX_TOPIC_LEN];
-        char jsonTopic[MQTT_MAX_TOPIC_LEN];
-        buildRelayTopic(stateTopic, sizeof(stateTopic), i, "state");
-        buildRelayTopic(cmdTopic, sizeof(cmdTopic), i, "set");
-        buildRelayTopic(jsonTopic, sizeof(jsonTopic), i, "json");
-        int topicLen = snprintf(topic, sizeof(topic),
-            "%s/switch/%s_relay%d/config",
-            mqttConfig.ha_prefix, mqttConfig.client_id, i + 1);
-        if (topicLen < 0 || topicLen >= (int)sizeof(topic)) continue;
-        int written = snprintf(payload, sizeof(payload),
-            "{"
-                "\"name\":\"%s\","
-                "\"unique_id\":\"%s_relay%d\","
-                "\"state_topic\":\"%s\","
-                "\"command_topic\":\"%s\","
-                "\"json_attributes_topic\":\"%s\","
-                "\"availability_topic\":\"%s\","
-                "\"payload_on\":\"ON\","
-                "\"payload_off\":\"OFF\","
-                "\"state_on\":\"ON\","
-                "\"state_off\":\"OFF\","
-                "\"retain\":true,"
-                "%s"
-            "}",
-            relayConfigs[i].name,
-            mqttConfig.client_id, i + 1,
-            stateTopic, cmdTopic, jsonTopic, availTopic,
-            deviceJson
-        );
-        if (written < 0 || written >= (int)sizeof(payload)) continue;
-        mqttClient.publish(topic, payload, true);
-        yield();
-    }
-    char allCmdTopic[MQTT_MAX_TOPIC_LEN];
-    char allStateTopic[MQTT_MAX_TOPIC_LEN];
-    buildMQTTTopic(allCmdTopic, sizeof(allCmdTopic), "all/set");
-    buildMQTTTopic(allStateTopic, sizeof(allStateTopic), "all/state");
-    int topicLen = snprintf(topic, sizeof(topic),
-        "%s/switch/%s_all/config",
-        mqttConfig.ha_prefix, mqttConfig.client_id);
-    if (topicLen > 0 && topicLen < (int)sizeof(topic)) {
-        int written = snprintf(payload, sizeof(payload),
-            "{"
-                "\"name\":\"All Relays\","
-                "\"unique_id\":\"%s_all_relays\","
-                "\"state_topic\":\"%s\","
-                "\"command_topic\":\"%s\","
-                "\"availability_topic\":\"%s\","
-                "\"payload_on\":\"ON\","
-                "\"payload_off\":\"OFF\","
-                "\"state_on\":\"ON\","
-                "\"state_off\":\"OFF\","
-                "\"retain\":true,"
-                "%s"
-            "}",
-            mqttConfig.client_id,
-            allStateTopic, allCmdTopic, availTopic,
-            deviceJson
-        );
-        if (written > 0 && written < (int)sizeof(payload)) {
-            mqttClient.publish(topic, payload, true);
-        }
     }
 }
 
@@ -1536,17 +1245,20 @@ main{max-width:1200px;margin:0 auto;padding:16px}
 .trow{display:flex;align-items:center;gap:8px;font-size:12px;margin-top:5px}
 .trow .l{color:#90A4AE;font-weight:600;width:32px;flex-shrink:0}
 .days{display:flex;gap:3px;margin-top:5px;flex-wrap:wrap}
-.day{width:28px;height:24px;border-radius:4px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none}
+.day{width:36px;height:36px;border-radius:4px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none;padding:0;font-family:inherit;color:#1A1A2E;-webkit-appearance:none;appearance:none}
 .day:hover{border-color:#90CAF9;background:#E3F2FD}
 .day.on{background:#1565C0;color:#fff;border-color:#1565C0}
+.day:focus-visible{outline:2px solid #1565C0;outline-offset:2px}
 .mdays{display:flex;gap:2px;margin-top:5px;flex-wrap:wrap}
-.mday{width:26px;height:22px;border-radius:3px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none}
+.mday{width:32px;height:32px;border-radius:3px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none;padding:0;font-family:inherit;color:#1A1A2E;-webkit-appearance:none;appearance:none}
 .mday:hover{border-color:#90CAF9;background:#E3F2FD}
 .mday.on{background:#1565C0;color:#fff;border-color:#1565C0}
+.mday:focus-visible{outline:2px solid #1565C0;outline-offset:2px}
 .months{display:flex;gap:3px;margin-top:5px;flex-wrap:wrap}
-.month{width:36px;height:24px;border-radius:4px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none}
+.month{width:44px;height:36px;border-radius:4px;border:1px solid #CFD8DC;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;cursor:pointer;background:#FAFAFA;transition:.15s;user-select:none;padding:0;font-family:inherit;color:#1A1A2E;-webkit-appearance:none;appearance:none}
 .month:hover{border-color:#90CAF9;background:#E3F2FD}
 .month.on{background:#1565C0;color:#fff;border-color:#1565C0}
+.month:focus-visible{outline:2px solid #1565C0;outline-offset:2px}
 .sched-section{margin-top:4px;font-size:10px;font-weight:600;color:#90A4AE;text-transform:uppercase;margin-bottom:2px}
 .night{font-size:10px;color:#0D47A1;background:#E3F2FD;padding:2px 6px;border-radius:4px;margin-left:auto;white-space:normal;word-break:break-word;max-width:100%;line-height:1.4;flex:1 1 auto;text-align:right}
 .night.always{background:#E8F5E9;color:#2E7D32}
@@ -1580,14 +1292,14 @@ hr{border:none;border-top:1px solid #ECEFF1;margin:14px 0}
 #toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);background:#323232;color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;transition:transform .28s;z-index:999;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.3);min-width:180px;text-align:center}
 #toast.show{transform:translateX(-50%) translateY(0)}
 #toast.ok{background:#2E7D32}#toast.er{background:#C62828}
-@media(max-width:500px){.grid{grid-template-columns:1fr}.ibar{grid-template-columns:1fr}.input-row{flex-direction:column}.day{width:24px;height:22px;font-size:10px}.mday{width:22px;height:20px;font-size:9px}.month{width:30px;height:22px;font-size:9px}}
+@media(max-width:500px){.grid{grid-template-columns:1fr}.ibar{grid-template-columns:1fr}.input-row{flex-direction:column}.day{width:34px;height:34px;font-size:10px}.mday{width:30px;height:30px;font-size:9px}.month{width:40px;height:34px;font-size:9px}}
 )css";
 
 // =============================================================================
 //  INDEX PAGE
 // =============================================================================
 const char index_html[] PROGMEM = R"raw(<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Relays</title>
 <link rel="stylesheet" href="/style.css"></head><body>
 <header>
@@ -1597,10 +1309,10 @@ const char index_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp">Time</a>
 <a href="/ap">AP</a>
 <a href="/gpio">GPIO</a>
-<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
+<a href="/mqtt">MQTT</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">Relay Controls &amp; Schedules</p>
@@ -1610,98 +1322,364 @@ const char index_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <script>
 const D=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+
+function toast(m,ok=true){
+  const t=document.getElementById('toast');
+  if(!t) return;
+  t.textContent=m;
+  t.className='show '+(ok?'ok':'er');
+  clearTimeout(t._t);
+  t._t=setTimeout(()=>t.className='',3000);
+}
+
+function fetchWithTimeout(url, options = {}, timeout = 10000) {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const timer = setTimeout(() => controller.abort(), timeout);
+  const opts = Object.assign({}, options, {signal: signal});
+  return fetch(url, opts).then(
+    response => { clearTimeout(timer); return response; },
+    error => { clearTimeout(timer); throw error; }
+  );
+}
+
+function tick(){
+  if(tick._inflight) return;
+  tick._inflight = true;
+  fetchWithTimeout('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
+    tick._inflight = false;
+    if(!d || typeof d !== 'object') return;
+    const clkEl = document.getElementById('clk');
+    if(clkEl) clkEl.textContent = (typeof d.time === 'string' && d.time) ? d.time : '--:--:--';
+    const de = document.getElementById('date');
+    if(de){
+      const wk = (typeof d.weekday === 'string' && d.weekday) ? d.weekday + ' ' : '';
+      const dt = (typeof d.date === 'string' && d.date) ? d.date : '--/--/----';
+      de.textContent = wk + dt;
+    }
+    const w=document.querySelector('.wd'),t=document.querySelector('.td');
+    if(w)w.className='dot '+(d.wifi?'g':'r');
+    if(t){
+      let tc='y';
+      if(d.timeSource==='ntp')tc='g';
+      else if(d.timeSource==='browser')tc='y';
+      else if(d.timeSource==='rtc')tc='g';
+      else tc='y';
+      t.className='dot '+tc;
+    }
+  }).catch(()=>{ tick._inflight = false; });
+}
 setInterval(tick,1000);tick();
+
 const NS=8;
-let relays=[],busy=false;
+let relays=[],busyCount=0;
+let loadInFlight = false;
+let pendingLoad = false;
 let editingRelay = -1;
 let editingInput = null;
 let editSuppressBlur = false;
-function escapeHtml(text) { const div = document.createElement('div'); div.textContent = text; return div.innerHTML; }
+let savingRelays = {};
+let nameEditSeq = {};
+let relayStatePolling = false;
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function utf8ByteLen(str){
+  if(typeof str !== 'string') return 0;
+  try {
+    if(typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str).length;
+  } catch(e) {}
+  let n = 0;
+  for(let i = 0; i < str.length; i++){
+    const c = str.charCodeAt(i);
+    if(c < 0x80) n += 1;
+    else if(c < 0x800) n += 2;
+    else if(c >= 0xD800 && c <= 0xDBFF) { n += 4; i++; }
+    else n += 3;
+  }
+  return n;
+}
+
+function clampUtf8Bytes(str, maxBytes){
+  if(typeof str !== 'string') return '';
+  if(maxBytes <= 0) return '';
+  let bytes = 0;
+  let out = '';
+  for(let i = 0; i < str.length; i++){
+    const c = str.charCodeAt(i);
+    let step;
+    if(c < 0x80){ step = 1; }
+    else if(c < 0x800){ step = 2; }
+    else if(c >= 0xD800 && c <= 0xDBFF){
+      if(i + 1 < str.length){
+        const c2 = str.charCodeAt(i + 1);
+        if(c2 >= 0xDC00 && c2 <= 0xDFFF){ step = 4; }
+        else { step = 3; }
+      } else { step = 3; }
+    } else { step = 3; }
+    if(bytes + step > maxBytes) break;
+    bytes += step;
+    if(step === 4){ out += str[i] + str[i+1]; i++; }
+    else out += str[i];
+  }
+  return out;
+}
+
+function requestLoad(){
+  if(busyCount > 0){ pendingLoad = true; return; }
+  load();
+}
+
 function load(){
-  if(busy)return;
-  fetch('/api/relays').then(r=>r.json()).then(d=>{
-    if(!Array.isArray(d))d=[];
+  if(busyCount > 0) return;
+  if(loadInFlight) return;
+  loadInFlight = true;
+  const g = document.getElementById('grid');
+  if(g && (!Array.isArray(relays) || relays.length === 0)) {
+    g.innerHTML = '<div class="card" style="text-align:center;padding:40px"><p style="color:#90A4AE">&#x23F3; Loading relays...</p></div>';
+  }
+  fetchWithTimeout('/api/relays').then(r=>r.json()).then(d=>{
+    loadInFlight = false;
+    if(!Array.isArray(d)){toast('Load error',false);if(g && (!Array.isArray(relays) || relays.length === 0))g.innerHTML='';return;}
     d=d.filter(r=>r&&typeof r==='object');
     d.forEach(r=>{
       if(!Array.isArray(r.schedules))r.schedules=[];
       r.schedules=r.schedules.filter(s=>s&&typeof s==='object');
-      while(r.schedules.length<8)r.schedules.push({startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0x7FFFFFFF,monthMask:0x0FFF});
+      if(r.schedules.length > NS) r.schedules = r.schedules.slice(0, NS);
+      while(r.schedules.length<NS)r.schedules.push({startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0x7FFFFFFF,monthMask:0x0FFF});
     });
     relays=d;render();
-  }).catch(()=>toast('Load error',false));
+  }).catch(()=>{
+    loadInFlight = false;
+    toast('Load error',false);
+    if(g && (!Array.isArray(relays) || relays.length === 0)) g.innerHTML='';
+  });
 }
+
 function toTS(h,m,s){return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
 function fromTS(v){const p=(v||'00:00:00').split(':');return{h:parseInt(p[0])||0,m:parseInt(p[1])||0,s:parseInt(p[2])||0};}
-function dayMaskToStr(d){ if(d===0x7F) return 'Everyday'; let s=''; for(let i=0;i<7;i++) if(d&(1<<i)) s+=D[i]+' '; return s.trim()||'None'; }
-function monthDayMaskToStr(md){ const v = (md === undefined || md === null) ? 0x7FFFFFFF : (md & 0x7FFFFFFF); if(v === 0) return 'None'; if(v === 0x7FFFFFFF) return 'All month days'; let s=''; for(let i=0;i<31;i++) if(v&(1<<i)) s+=(i+1)+','; return s.replace(/,$/,'')||'None'; }
-function monthMaskToStr(mm) { if (mm === 0x0FFF) return 'All months'; if (mm === 0 || mm === undefined || mm === null) return ''; let s=''; for(let i=0;i<12;i++) if(mm&(1<<i)) s+=M[i]+' '; return s.trim()||'None'; }
+
+function refreshRelayStates(){
+  if(busyCount>0 || editingRelay!==-1 || relayStatePolling) return;
+  relayStatePolling=true;
+  fetchWithTimeout('/api/relay/states').then(r=>{if(!r.ok)throw new Error('state request failed');return r.json();}).then(d=>{
+    if(!d || !Array.isArray(d.relays)) return;
+    if(d.count!==relays.length || d.relays.length!==relays.length){ requestLoad(); return; }
+    d.relays.forEach((state,i)=>{
+      if(!state || !relays[i]) return;
+      relays[i].state=!!state.state;
+      relays[i].manual=!!state.manual;
+      const badge=document.getElementById('stateBadge_'+i);
+      if(badge){
+        badge.textContent=state.manual?'MANUAL':state.state?'ON':'OFF';
+        badge.className='badge '+(state.manual?'bman':state.state?'bon':'boff');
+      }
+    });
+  }).catch(()=>{}).then(()=>{relayStatePolling=false;});
+}
+
+function dayMaskToStr(d){
+  if(d === undefined || d === null) d = 0x7F;
+  d = d & 0x7F;
+  if(d===0x7F) return 'Everyday';
+  if(d===0) return 'None';
+  let s='';
+  for(let i=0;i<7;i++) if(d&(1<<i)) s+=D[i]+' ';
+  return s.trim()||'None';
+}
+
+function monthDayMaskToStr(md){
+  let v = (md === undefined || md === null) ? 0x7FFFFFFF : md;
+  v = v & 0x7FFFFFFF;
+  if(v === 0) return 'None';
+  if(v === 0x7FFFFFFF) return 'All month days';
+  let s='';
+  for(let i=0;i<31;i++) if(v&(1<<i)) s+=(i+1)+',';
+  return s.replace(/,$/,'')||'None';
+}
+
+function monthMaskToStr(mm) {
+  if (mm === undefined || mm === null) return '';
+  mm = mm & 0x0FFF;
+  if (mm === 0x0FFF) return 'All months';
+  if (mm === 0) return 'None';
+  let s='';
+  for(let i=0;i<12;i++) if(mm&(1<<i)) s+=M[i]+' ';
+  return s.trim()||'None';
+}
+
 function nightBadge(sc){
-  if(!sc.enabled)return'';
-  const a=sc.startHour*3600+sc.startMinute*60+sc.startSecond;
-  const b=sc.stopHour*3600+sc.stopMinute*60+sc.stopSecond;
-  const ds=dayMaskToStr(sc.days === undefined ? 0x7F : sc.days);
-  const ms=monthDayMaskToStr(sc.monthDays === undefined ? 0x7FFFFFFF : sc.monthDays);
-  const mm=monthMaskToStr(sc.monthMask === undefined ? 0x0FFF : sc.monthMask);
+  if(!sc) return '';
+  if(!sc.enabled) return '';
+  const sh = (typeof sc.startHour === 'number') ? sc.startHour : 0;
+  const sm = (typeof sc.startMinute === 'number') ? sc.startMinute : 0;
+  const ss = (typeof sc.startSecond === 'number') ? sc.startSecond : 0;
+  const eh = (typeof sc.stopHour === 'number') ? sc.stopHour : 0;
+  const em = (typeof sc.stopMinute === 'number') ? sc.stopMinute : 0;
+  const es = (typeof sc.stopSecond === 'number') ? sc.stopSecond : 0;
+  const a = sh*3600 + sm*60 + ss;
+  const b = eh*3600 + em*60 + es;
+  const ds = dayMaskToStr(sc.days);
+  const ms = monthDayMaskToStr(sc.monthDays);
+  const mm = monthMaskToStr(sc.monthMask);
   let parts=[];
-  if(ds) parts.push(ds);
+  if(ds === 'None') parts.push('No days');
+  else if(ds) parts.push(ds);
   if(ms && ms!=='All month days') parts.push('Days: '+ms);
   if(mm && mm!=='All months') parts.push('Months: '+mm);
-  let info=parts.join(' | ');
-  if(a===b)return'<span class="night always">&#x25CF; Always ON ('+info+')</span>';
-  if(a>b) return'<span class="night">&#x1F319; Overnight ('+info+')</span>';
-  return'<span class="night">&#x1F319; '+info+'</span>';
+  let info = parts.join(' | ');
+  if(!info) info = 'Always';
+  if(a===b) return '<span class="night always">&#x25CF; Always ON ('+info+')</span>';
+  if(a>b) return '<span class="night">&#x1F319; Overnight ('+info+')</span>';
+  return '<span class="night">&#x1F319; '+info+'</span>';
 }
+
 function startEditName(relayIdx) {
+  if(!relays[relayIdx] || typeof relays[relayIdx] !== 'object') return;
+  if (editingRelay === relayIdx) {
+    if (editingInput) { editingInput.focus(); editingInput.select(); }
+    return;
+  }
   if (editingRelay !== -1) cancelEdit();
   const nameSpan = document.getElementById('name_' + relayIdx);
   if (!nameSpan) return;
   const currentName = relays[relayIdx].name || ('Relay ' + (relayIdx + 1));
   const input = document.createElement('input');
-  input.type = 'text'; input.value = currentName; input.maxLength = 15;
+  input.type = 'text';
+  input.value = currentName;
+  input.maxLength = 15;
   input.style.cssText = 'font-size:15px;font-weight:700;padding:2px 6px;border:1px solid #1565C0;border-radius:5px;width:120px;background:#fff;color:#1A1A2E;';
-  input.id = 'edit_' + relayIdx;
-  input.onblur = () => { if (editSuppressBlur) return; saveNameEdit(relayIdx, input.value); };
-  input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); editSuppressBlur = true; saveNameEdit(relayIdx, input.value); editSuppressBlur = false; } else if (e.key === 'Escape') { e.preventDefault(); editSuppressBlur = true; cancelEdit(); editSuppressBlur = false; } };
+  input.onblur = () => {
+    if (editSuppressBlur) return;
+    saveNameEdit(relayIdx, input.value);
+  };
+  input.addEventListener('input', () => {
+    if(utf8ByteLen(input.value) > 15){
+      input.value = clampUtf8Bytes(input.value, 15);
+    }
+  });
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      editSuppressBlur = true;
+      saveNameEdit(relayIdx, input.value);
+      editSuppressBlur = false;
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      editSuppressBlur = true;
+      cancelEdit();
+      editSuppressBlur = false;
+    }
+  };
   nameSpan.style.display = 'none';
   nameSpan.parentNode.insertBefore(input, nameSpan.nextSibling);
-  editingRelay = relayIdx; editingInput = input; input.focus(); input.select();
+  editingRelay = relayIdx;
+  editingInput = input;
+  input.focus();
+  input.select();
 }
-function cancelEdit() { if (editingRelay !== -1) { const nameSpan = document.getElementById('name_' + editingRelay); if (nameSpan) nameSpan.style.display = ''; editSuppressBlur = true; if (editingInput) editingInput.remove(); editSuppressBlur = false; editingRelay = -1; editingInput = null; } }
+
+function cancelEdit() {
+  if (editingRelay !== -1) {
+    const nameSpan = document.getElementById('name_' + editingRelay);
+    if (nameSpan) nameSpan.style.display = '';
+    editSuppressBlur = true;
+    if (editingInput) editingInput.remove();
+    editSuppressBlur = false;
+    editingRelay = -1;
+    editingInput = null;
+  }
+}
+
 function saveNameEdit(relayIdx, newName) {
-  newName = newName.trim(); if (newName.length === 0) newName = 'Relay ' + (relayIdx + 1);
+  if(!relays[relayIdx] || typeof relays[relayIdx] !== 'object'){
+    if(editingRelay === relayIdx){ editingRelay = -1; editingInput = null; }
+    return;
+  }
+  if(typeof newName !== 'string') newName = '';
+  newName = newName.trim();
+  if(utf8ByteLen(newName) > 15){
+    newName = clampUtf8Bytes(newName, 15).trim();
+  }
+  while(newName.length > 0 && utf8ByteLen(newName) > 15){
+    newName = newName.slice(0, -1).trim();
+  }
+  if (newName.length === 0) {
+    newName = 'Relay ' + (relayIdx + 1);
+  }
   const nameSpan = document.getElementById('name_' + relayIdx);
+  const oldName = relays[relayIdx].name || ('Relay ' + (relayIdx + 1));
   relays[relayIdx].name = newName;
-  if (nameSpan) { nameSpan.textContent = newName; nameSpan.style.display = ''; }
+  if (nameSpan) {
+    nameSpan.textContent = newName;
+    nameSpan.style.display = '';
+  }
   editSuppressBlur = true;
   if (editingInput) editingInput.remove();
   editSuppressBlur = false;
-  editingRelay = -1; editingInput = null;
-  fetch('/api/relay/name', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({relay: relayIdx, name: newName}) })
-  .then(r => r.json()).then(d => { if (d.success) toast('Name saved!'); else toast('Failed to save name', false); })
-  .catch(() => toast('Error saving name', false));
+  editingRelay = -1;
+  editingInput = null;
+  const mySeq = (nameEditSeq[relayIdx] || 0) + 1;
+  nameEditSeq[relayIdx] = mySeq;
+  fetchWithTimeout('/api/relay/name', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({relay: relayIdx, name: newName})
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (nameEditSeq[relayIdx] !== mySeq) return;
+    if (d && d.success) {
+      toast('Name saved!');
+    } else {
+      relays[relayIdx].name = oldName;
+      const span = document.getElementById('name_' + relayIdx);
+      if (span) span.textContent = oldName;
+      toast('Failed to save name', false);
+    }
+  })
+  .catch(() => {
+    if (nameEditSeq[relayIdx] !== mySeq) return;
+    relays[relayIdx].name = oldName;
+    const span = document.getElementById('name_' + relayIdx);
+    if (span) span.textContent = oldName;
+    toast('Error saving name', false);
+  });
 }
+
 function render(){
-  const g=document.getElementById('grid'); g.innerHTML='';
-  if (!relays || relays.length === 0) { g.innerHTML = '<div class="card" style="text-align:center;padding:40px"><p style="color:#90A4AE">No relays configured. <a href="/gpio" style="color:#1565C0">Configure GPIO pins</a></p></div>'; return; }
+  const g = document.getElementById('grid');
+  if(!g) return;
+  g.innerHTML='';
+  if (!Array.isArray(relays) || relays.length === 0) {
+    g.innerHTML = '<div class="card" style="text-align:center;padding:40px"><p style="color:#90A4AE">No relays configured. <a href="/gpio" style="color:#1565C0">Configure GPIO pins</a></p></div>';
+    return;
+  }
   relays.forEach((r,i)=>{
-    const sl=r.manual?'MANUAL':r.state?'ON':'OFF';
-    const sc=r.manual?'bman':r.state?'bon':'boff';
+    if(!r || typeof r !== 'object'){
+      r = {state:false, manual:false, name:'Relay '+(i+1), schedules:[]};
+      relays[i] = r;
+    }
+    const sl = r.manual ? 'MANUAL' : r.state ? 'ON' : 'OFF';
+    const sc = r.manual ? 'bman' : r.state ? 'bon' : 'boff';
     const displayName = r.name || ('Relay '+(i+1));
-    let html=`<div class="card">
+    let html = `<div class="card">
 <div class="card-hdr">
 <span class="ctitle" id="name_${i}" ondblclick="startEditName(${i})" title="Double-click to rename">${escapeHtml(displayName)}</span>
-<span class="badge ${sc}">${sl}</span>
+<span id="stateBadge_${i}" class="badge ${sc}">${sl}</span>
 </div>
 <div class="brow">
-<button class="btn bon-b" onclick="mc(${i},true)">ON</button>
-<button class="btn boff-b" onclick="mc(${i},false)">OFF</button>
-<button class="btn baut" onclick="ra(${i})">Auto</button>
+<button type="button" class="btn bon-b" onclick="mc(${i},true)">ON</button>
+<button type="button" class="btn boff-b" onclick="mc(${i},false)">OFF</button>
+<button type="button" class="btn baut" onclick="ra(${i})">Auto</button>
 </div>
 <div class="slist">`;
     for(let s=0;s<NS;s++){
-      const sc2=(r.schedules&&r.schedules[s])||{startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0x7FFFFFFF,monthMask:0x0FFF};
+      const sc2 = r.schedules[s] || {startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0x7FFFFFFF,monthMask:0x0FFF};
       const dayBits = (sc2.days === undefined || sc2.days === null) ? 0x7F : sc2.days;
       const rawMonthDayBits = (sc2.monthDays === undefined || sc2.monthDays === null) ? 0x7FFFFFFF : sc2.monthDays;
       const monthDayBits = rawMonthDayBits & 0x7FFFFFFF;
@@ -1719,34 +1697,197 @@ function render(){
 </div>
 <div class="sched-section">Days of Week</div>
 <div class="days" id="day_${i}_${s}">`;
-      for(let d=0;d<7;d++){ const mask = 1<<d; html+=`<div class="day${(dayBits&mask)?' on':''}" onclick="toggleDay(${i},${s},${d})">${D[d]}</div>`; }
+      for(let d=0;d<7;d++){
+        const mask = 1<<d;
+        html+=`<button type="button" class="day${(dayBits&mask)?' on':''}" onclick="toggleDay(${i},${s},${d})" aria-pressed="${(dayBits&mask)?'true':'false'}" aria-label="${D[d]}">${D[d]}</button>`;
+      }
       html+=`</div>
 <div class="sched-section">Days of Month</div>
 <div class="mdays" id="mday_${i}_${s}">`;
-      for(let d=0;d<31;d++){ const mask = 1<<d; html+=`<div class="mday${(monthDayBits&mask)?' on':''}" onclick="toggleMonthDay(${i},${s},${d})" title="Day ${d+1}">${d+1}</div>`; }
+      for(let d=0;d<31;d++){
+        const mask = 1<<d;
+        html+=`<button type="button" class="mday${(monthDayBits&mask)?' on':''}" onclick="toggleMonthDay(${i},${s},${d})" title="Day ${d+1}" aria-pressed="${(monthDayBits&mask)?'true':'false'}" aria-label="Day ${d+1}">${d+1}</button>`;
+      }
       html+=`</div>
 <div class="sched-section">Months of Year</div>
 <div class="months" id="mon_${i}_${s}">`;
-      for(let m=0;m<12;m++){ const mask = 1<<m; html+=`<div class="month${(monthMask&mask)?' on':''}" onclick="toggleMonth(${i},${s},${m})">${M[m]}</div>`; }
+      for(let m=0;m<12;m++){
+        const mask = 1<<m;
+        html+=`<button type="button" class="month${(monthMask&mask)?' on':''}" onclick="toggleMonth(${i},${s},${m})" aria-pressed="${(monthMask&mask)?'true':'false'}" aria-label="${M[m]}">${M[m]}</button>`;
+      }
       html+=`</div>
 </div>`;
     }
-    html+=`</div><button class="btn bsave" onclick="save(${i})">&#x1F4BE; Save ${escapeHtml(displayName)}</button></div>`;
-    const el=document.createElement('div'); el.innerHTML=html; g.appendChild(el.firstChild);
+    html+=`</div><button type="button" class="btn bsave" onclick="save(${i})">&#x1F4BE; Save ${escapeHtml(displayName)}</button></div>`;
+    const el=document.createElement('div');
+    el.innerHTML=html;
+    while (el.firstChild) g.appendChild(el.firstChild);
   });
 }
-function toggleDay(ri,si,dayIdx){ const mask = 1<<dayIdx; let cur = relays[ri].schedules[si].days; if(cur === undefined || cur === null) cur = 0x7F; cur ^= mask; relays[ri].schedules[si].days = cur; const dayEl = document.getElementById('day_'+ri+'_'+si).children[dayIdx]; if(dayEl) dayEl.className = 'day' + ((cur & mask)?' on':''); const nb=document.getElementById('nb_'+ri+'_'+si); if(nb)nb.innerHTML=nightBadge(relays[ri].schedules[si]); }
-function toggleMonthDay(ri,si,dayIdx){ const mask = 1<<dayIdx; let cur = relays[ri].schedules[si].monthDays; if(cur === undefined || cur === null) cur = 0x7FFFFFFF; cur = cur & 0x7FFFFFFF; cur ^= mask; relays[ri].schedules[si].monthDays = cur; const mdayEl = document.getElementById('mday_'+ri+'_'+si).children[dayIdx]; if(mdayEl) mdayEl.className = 'mday' + ((cur & mask)?' on':''); const nb=document.getElementById('nb_'+ri+'_'+si); if(nb)nb.innerHTML=nightBadge(relays[ri].schedules[si]); }
-function toggleMonth(ri,si,mIdx){ const mask = 1<<mIdx; let cur = relays[ri].schedules[si].monthMask; if(cur === undefined || cur === null) cur = 0x0FFF; cur ^= mask; relays[ri].schedules[si].monthMask = cur; const monEl = document.getElementById('mon_'+ri+'_'+si).children[mIdx]; if(monEl) monEl.className = 'month' + ((cur & mask)?' on':''); const nb=document.getElementById('nb_'+ri+'_'+si); if(nb)nb.innerHTML=nightBadge(relays[ri].schedules[si]); }
-function uf(ri,si,field,val){ const sc=relays[ri].schedules[si]; if(field==='en'){ sc.enabled=val; const el=document.getElementById('si_'+ri+'_'+si); if(el)el.className='si'+(val?' act':''); } else if(field==='start'){ const t=fromTS(val);sc.startHour=t.h;sc.startMinute=t.m;sc.startSecond=t.s; } else if(field==='stop'){ const t=fromTS(val);sc.stopHour=t.h;sc.stopMinute=t.m;sc.stopSecond=t.s; } const nb=document.getElementById('nb_'+ri+'_'+si); if(nb)nb.innerHTML=nightBadge(sc); }
-function mc(ri,state){ fetch('/api/relay/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri,state})}).then(r=>r.json()).then(d=>{if(d.success){toast((relays[ri].name||('Relay '+(ri+1)))+' '+(state?'ON':'OFF'));load();}else toast('Failed',false);}).catch(()=>toast('Error',false)); }
-function ra(ri){ fetch('/api/relay/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri})}).then(r=>r.json()).then(d=>{if(d.success){toast((relays[ri].name||('Relay '+(ri+1)))+' \u2192 Auto');load();}else toast('Failed',false);}).catch(()=>toast('Error',false)); }
-function save(ri){ busy=true; fetch('/api/relay/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri,schedules:relays[ri].schedules})}).then(r=>r.json()).then(d=>{busy=false;if(d.success)toast((relays[ri].name||('Relay '+(ri+1)))+' saved!');else toast('Save failed',false);}).catch(()=>{busy=false;toast('Error',false);}); }
+
+function toggleDay(ri,si,dayIdx){
+  if(!relays[ri] || !Array.isArray(relays[ri].schedules)) return;
+  let sc = relays[ri].schedules[si];
+  if(!sc || typeof sc !== 'object') return;
+  const mask = 1<<dayIdx;
+  let cur = sc.days;
+  if(cur === undefined || cur === null) cur = 0x7F;
+  cur = (cur & 0x7F) ^ mask;
+  sc.days = cur;
+  const dayEl = document.getElementById('day_'+ri+'_'+si);
+  if(dayEl && dayEl.children[dayIdx]){
+    const c = dayEl.children[dayIdx];
+    c.className = 'day' + ((cur & mask)?' on':'');
+    c.setAttribute('aria-pressed', (cur & mask) ? 'true' : 'false');
+  }
+  const nb=document.getElementById('nb_'+ri+'_'+si);
+  if(nb)nb.innerHTML=nightBadge(sc);
+}
+
+function toggleMonthDay(ri,si,dayIdx){
+  if(!relays[ri] || !Array.isArray(relays[ri].schedules)) return;
+  let sc = relays[ri].schedules[si];
+  if(!sc || typeof sc !== 'object') return;
+  const mask = 1<<dayIdx;
+  let cur = sc.monthDays;
+  if(cur === undefined || cur === null) cur = 0x7FFFFFFF;
+  cur = cur & 0x7FFFFFFF;
+  cur ^= mask;
+  sc.monthDays = cur;
+  const mdayEl = document.getElementById('mday_'+ri+'_'+si);
+  if(mdayEl && mdayEl.children[dayIdx]){
+    const c = mdayEl.children[dayIdx];
+    c.className = 'mday' + ((cur & mask)?' on':'');
+    c.setAttribute('aria-pressed', (cur & mask) ? 'true' : 'false');
+  }
+  const nb=document.getElementById('nb_'+ri+'_'+si);
+  if(nb)nb.innerHTML=nightBadge(sc);
+}
+
+function toggleMonth(ri,si,mIdx){
+  if(!relays[ri] || !Array.isArray(relays[ri].schedules)) return;
+  let sc = relays[ri].schedules[si];
+  if(!sc || typeof sc !== 'object') return;
+  const mask = 1<<mIdx;
+  let cur = sc.monthMask;
+  if(cur === undefined || cur === null) cur = 0x0FFF;
+  cur = cur & 0x0FFF;
+  cur ^= mask;
+  sc.monthMask = cur;
+  const monEl = document.getElementById('mon_'+ri+'_'+si);
+  if(monEl && monEl.children[mIdx]){
+    const c = monEl.children[mIdx];
+    c.className = 'month' + ((cur & mask)?' on':'');
+    c.setAttribute('aria-pressed', (cur & mask) ? 'true' : 'false');
+  }
+  const nb=document.getElementById('nb_'+ri+'_'+si);
+  if(nb)nb.innerHTML=nightBadge(sc);
+}
+
+function uf(ri,si,field,val){
+  if(!relays[ri] || !Array.isArray(relays[ri].schedules)) return;
+  let sc=relays[ri].schedules[si];
+  if(!sc || typeof sc !== 'object'){
+    sc={startHour:0,startMinute:0,startSecond:0,stopHour:0,stopMinute:0,stopSecond:0,enabled:false,days:0x7F,monthDays:0x7FFFFFFF,monthMask:0x0FFF};
+    relays[ri].schedules[si] = sc;
+  }
+  if(field==='en'){
+    sc.enabled = !!val;
+    const el = document.getElementById('si_'+ri+'_'+si);
+    if(el) el.className = 'si' + (val?' act':'');
+  }else if(field==='start'){
+    const t=fromTS(val);sc.startHour=t.h;sc.startMinute=t.m;sc.startSecond=t.s;
+  }else if(field==='stop'){
+    const t=fromTS(val);sc.stopHour=t.h;sc.stopMinute=t.m;sc.stopSecond=t.s;
+  }
+  const nb=document.getElementById('nb_'+ri+'_'+si);
+  if(nb) nb.innerHTML = nightBadge(sc);
+}
+
+function mc(ri,state){
+  if(!relays[ri]) return;
+  fetchWithTimeout('/api/relay/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri,state:!!state})})
+  .then(r=>r.json()).then(d=>{
+    if(d && d.success){toast((relays[ri].name||('Relay '+(ri+1)))+' '+(state?'ON':'OFF'));requestLoad();}
+    else toast('Failed',false);
+  }).catch(()=>toast('Error',false));
+}
+
+function ra(ri){
+  if(!relays[ri]) return;
+  fetchWithTimeout('/api/relay/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri})})
+  .then(r=>r.json()).then(d=>{
+    if(d && d.success){toast((relays[ri].name||('Relay '+(ri+1)))+' \u2192 Auto');requestLoad();}
+    else toast('Failed',false);
+  }).catch(()=>toast('Error',false));
+}
+
+function save(ri){
+  if(!relays[ri]) return;
+  if(savingRelays[ri]) return;
+  savingRelays[ri] = true;
+  busyCount++;
+  const btn = document.querySelector(`button[onclick="save(${ri})"]`);
+  if(btn){ btn.disabled = true; btn.textContent = 'Saving...'; }
+  const safeName = escapeHtml((relays[ri] && relays[ri].name) || ('Relay '+(ri+1)));
+  const srcSchedules = (Array.isArray(relays[ri].schedules) ? relays[ri].schedules : []).slice(0, NS);
+  const payloadSchedules = srcSchedules.map(function(s){
+    s = s || {};
+    const clampInt = (v, lo, hi, dflt) => {
+      const n = parseInt(v, 10);
+      if(isNaN(n)) return dflt;
+      return Math.max(lo, Math.min(hi, n));
+    };
+    return {
+      startHour:   clampInt(s.startHour,   0, 23, 0),
+      startMinute: clampInt(s.startMinute, 0, 59, 0),
+      startSecond: clampInt(s.startSecond, 0, 59, 0),
+      stopHour:    clampInt(s.stopHour,    0, 23, 0),
+      stopMinute:  clampInt(s.stopMinute,  0, 59, 0),
+      stopSecond:  clampInt(s.stopSecond,  0, 59, 0),
+      enabled:     !!s.enabled,
+      days:        ((typeof s.days === 'number' ? s.days : 0x7F) & 0x7F),
+      monthDays:   ((typeof s.monthDays === 'number' ? s.monthDays : 0x7FFFFFFF) & 0x7FFFFFFF),
+      monthMask:   ((typeof s.monthMask === 'number' ? s.monthMask : 0x0FFF) & 0x0FFF)
+    };
+  });
+  while(payloadSchedules.length < NS){
+    payloadSchedules.push({
+      startHour:0, startMinute:0, startSecond:0,
+      stopHour:0, stopMinute:0, stopSecond:0,
+      enabled:false, days:0x7F, monthDays:0x7FFFFFFF, monthMask:0x0FFF
+    });
+  }
+  fetchWithTimeout('/api/relay/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({relay:ri,schedules:payloadSchedules})})
+  .then(r=>r.json()).then(d=>{
+    savingRelays[ri] = false;
+    if(busyCount > 0) busyCount--;
+    if(btn){
+      btn.disabled = false;
+      btn.innerHTML = '&#x1F4BE; Save ' + safeName;
+    }
+    if(busyCount === 0 && pendingLoad){ pendingLoad = false; load(); }
+    if(d && d.success) toast((relays[ri].name||('Relay '+(ri+1)))+' saved!');
+    else toast('Save failed',false);
+  })
+  .catch(()=>{
+    savingRelays[ri] = false;
+    if(busyCount > 0) busyCount--;
+    if(btn){
+      btn.disabled = false;
+      btn.innerHTML = '&#x1F4BE; Save ' + safeName;
+    }
+    if(busyCount === 0 && pendingLoad){ pendingLoad = false; load(); }
+    toast('Error',false);
+  });
+}
+
 load();
+setInterval(refreshRelayStates,2000);
 </script></body></html>)raw";
 
 // =============================================================================
-//  WiFi PAGE
+//  WIFI PAGE
 // =============================================================================
 const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1759,23 +1900,26 @@ const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp">Time</a>
 <a href="/ap">AP</a>
 <a href="/gpio">GPIO</a>
-<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
+<a href="/mqtt">MQTT</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">WiFi Station Settings</p>
 <div class="card fcrd">
 <div id="status" class="alert ai" style="display:none"></div>
+
 <div class="fg">
 <label style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;margin-bottom:8px">
 <span style="font-size:14px;font-weight:600">WiFi Station Mode</span>
 <button id="staToggleBtn" class="btn" style="min-width:90px;padding:8px 16px;font-weight:700;transition:all 0.2s" onclick="toggleStation()"></button>
 </label>
-<small>When disabled, ESP32S3 runs in AP-only mode (no internet/NTP). Relay schedules using internal RTC/DS3231 will still work.</small>
+<small>When disabled, ESP32S3 runs in AP-only mode (no internet/NTP). Relay schedules using internal RTC/DS3231 will still work. You can still access this UI via the AP.</small>
 </div>
+
 <hr>
+
 <div id="stationConfig">
 <div class="fg">
 <label>Network SSID</label>
@@ -1785,62 +1929,178 @@ const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 </div>
 </div>
 <div class="netlist" id="netlist"></div>
-<div class="fg"><label>Password</label><input type="password" id="pw" placeholder="Enter password (leave blank to keep)"></div>
+<div class="fg"><label>Password</label><input type="password" id="pw" placeholder="Enter password"></div>
 <button class="btn bsave" onclick="saveWiFi()">&#x1F4BE; Save &amp; Connect</button>
 </div>
 </div>
 </main>
 <div id="toast"></div>
 <style>
-.btn-sta-on { background: linear-gradient(135deg, #1565C0 0%, #0D47A1 100%); color: #fff; box-shadow: 0 2px 4px rgba(21,101,192,0.3); }
-.btn-sta-on:hover { background: linear-gradient(135deg, #1E88E5 0%, #1565C0 100%); filter: brightness(1.05); }
-.btn-sta-off { background: linear-gradient(135deg, #C62828 0%, #B71C1C 100%); color: #fff; box-shadow: 0 2px 4px rgba(198,40,40,0.3); }
-.btn-sta-off:hover { background: linear-gradient(135deg, #E53935 0%, #C62828 100%); filter: brightness(1.05); }
+.btn-sta-on {
+    background: linear-gradient(135deg, #1565C0 0%, #0D47A1 100%);
+    color: #fff;
+    box-shadow: 0 2px 4px rgba(21,101,192,0.3);
+}
+.btn-sta-on:hover {
+    background: linear-gradient(135deg, #1E88E5 0%, #1565C0 100%);
+    filter: brightness(1.05);
+}
+.btn-sta-off {
+    background: linear-gradient(135deg, #C62828 0%, #B71C1C 100%);
+    color: #fff;
+    box-shadow: 0 2px 4px rgba(198,40,40,0.3);
+}
+.btn-sta-off:hover {
+    background: linear-gradient(135deg, #E53935 0%, #C62828 100%);
+    filter: brightness(1.05);
+}
 </style>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+
+function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status); return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
-function updateStaButton(enabled) { const btn = document.getElementById('staToggleBtn'); if(enabled) { btn.textContent = '✓ ON'; btn.className = 'btn btn-sta-on'; btn.style.minWidth = '90px'; } else { btn.textContent = '✗ OFF'; btn.className = 'btn btn-sta-off'; btn.style.minWidth = '90px'; } }
+
+function updateStaButton(enabled) {
+    const btn = document.getElementById('staToggleBtn');
+    if(!btn) return;
+    btn.dataset.enabled = enabled ? 'true' : 'false';
+    if(enabled) {
+        btn.textContent = '✓ ON';
+        btn.className = 'btn btn-sta-on';
+    } else {
+        btn.textContent = '✗ OFF';
+        btn.className = 'btn btn-sta-off';
+    }
+    btn.style.minWidth = '90px';
+}
+
+function isStaEnabled() {
+    const btn = document.getElementById('staToggleBtn');
+    return !!(btn && btn.dataset.enabled === 'true');
+}
+
 function loadWiFiStatus() {
-    fetch('/api/wifi').then(r=>r.json()).then(d=>{
-        document.getElementById('ssid').value=d.ssid||'';
+    fetch('/api/wifi').then(r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    }).then(d=>{
+        const ssidEl = document.getElementById('ssid');
+        const active = document.activeElement;
+        const serverSSID = d.ssid || '';
+        if (ssidEl && active !== ssidEl && ssidEl.value !== serverSSID) {
+            ssidEl.value = serverSSID;
+        }
+        window._lastSSID = serverSSID;
         const staEnabled = d.sta_enabled !== undefined ? d.sta_enabled : true;
         updateStaButton(staEnabled);
         const stationDiv = document.getElementById('stationConfig');
-        if(stationDiv) { stationDiv.style.opacity = staEnabled ? '1' : '0.5'; const inputs = stationDiv.querySelectorAll('input, button'); inputs.forEach(inp => inp.disabled = !staEnabled); }
-        const s=document.getElementById('status'); s.style.display='';
-        if(staEnabled && d.connected){ const bars=rssiBar(d.rssi||0); s.innerHTML='<span style="font-weight:700">✓ Connected</span> to: <strong>'+d.ssid+'</strong> ('+d.ip+') &nbsp;'+bars+' '+d.rssi+'dBm'; s.className='alert ai'; }
-        else if(staEnabled && !d.connected) { s.innerHTML='<span style="font-weight:700">⚠ Not Connected</span><br>Configure SSID/password above to connect to a WiFi network.'; s.className='alert aw'; }
-        else { s.innerHTML='<span style="font-weight:700">⛔ WiFi Station Disabled</span><br>ESP32S3 running in AP-only mode.'; s.className='alert aw'; }
-    }).catch(()=>{});
+        if(stationDiv) {
+            stationDiv.style.opacity = staEnabled ? '1' : '0.5';
+            const inputs = stationDiv.querySelectorAll('input, button');
+            inputs.forEach(inp => inp.disabled = !staEnabled);
+        }
+        const s=document.getElementById('status');
+        s.style.display='';
+        s.textContent='';
+        if(staEnabled && d.connected){
+            const span1 = document.createElement('span');
+            span1.style.fontWeight='700';
+            span1.textContent='✓ Connected';
+            s.appendChild(span1);
+            s.appendChild(document.createTextNode(' to: '));
+            const strong = document.createElement('strong');
+            strong.textContent = d.ssid || '';
+            s.appendChild(strong);
+            s.appendChild(document.createTextNode(' ('+(d.ip||'')+') '));
+            const bars = document.createElement('span');
+            bars.innerHTML = rssiBar(d.rssi||0);
+            s.appendChild(bars);
+            s.appendChild(document.createTextNode(' '+(d.rssi||0)+'dBm'));
+            s.className='alert ai';
+        } else if(staEnabled && !d.connected) {
+            const b1 = document.createElement('span');
+            b1.style.fontWeight='700';
+            b1.textContent='⚠ Not Connected';
+            s.appendChild(b1);
+            s.appendChild(document.createElement('br'));
+            s.appendChild(document.createTextNode('Configure SSID/password above to connect to a WiFi network.'));
+            s.className='alert aw';
+        } else {
+            const b1 = document.createElement('span');
+            b1.style.fontWeight='700';
+            b1.textContent='⛔ WiFi Station Disabled';
+            s.appendChild(b1);
+            s.appendChild(document.createElement('br'));
+            s.appendChild(document.createTextNode('ESP32S3 running in AP-only mode. Enable above to connect to WiFi networks for NTP time sync.'));
+            s.className='alert aw';
+        }
+    }).catch(()=>{
+    });
 }
-function rssiBar(rssi){ const b=rssi>=-50?4:rssi>=-60?3:rssi>=-70?2:1; let s='<span class="bars">'; for(let i=1;i<=4;i++)s+='<span class="bar'+(i<=b?' on':'')+('" style="height:'+(i*3+2)+'px"></span>'); return s+'</span>'; }
+
+function rssiBar(rssi){
+    const b=rssi>=-50?4:rssi>=-60?3:rssi>=-70?2:1;
+    let s='<span class="bars">';
+    for(let i=1;i<=4;i++)s+='<span class="bar'+(i<=b?' on':'')+('" style="height:'+(i*3+2)+'px"></span>');
+    return s+'</span>';
+}
+
 function toggleStation() {
     const btn = document.getElementById('staToggleBtn');
-    const wasEnabled = btn.textContent === '✓ ON';
+    if(!btn || btn.disabled) return;
+    const wasEnabled = isStaEnabled();
     const willEnable = !wasEnabled;
-    btn.disabled = true; btn.textContent = '...';
-    fetch('/api/wifi', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sta_enabled: willEnable}) })
-    .then(r=>r.json()).then(d=>{
+    btn.disabled = true;
+    btn.textContent = '...';
+    fetch('/api/wifi', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({sta_enabled: willEnable})
+    }).then(r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    }).then(d=>{
         btn.disabled = false;
         if(d.success) {
             updateStaButton(willEnable);
             if(!willEnable) {
+                window._staDisabled = true;
+                if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+                if(scanning) endScan();
+                const nlReset = document.getElementById('netlist');
+                if(nlReset){ nlReset.innerHTML=''; nlReset.style.display='none'; }
                 toast('WiFi Station OFF \u2014 NTP unavailable; use RTC/Browser sync', false);
             } else {
+                window._staDisabled = false;
                 toast('WiFi Station ON', true);
             }
             const stationDiv = document.getElementById('stationConfig');
-            if(stationDiv) { stationDiv.style.opacity = willEnable ? '1' : '0.5'; const inputs = stationDiv.querySelectorAll('input, button'); inputs.forEach(inp => inp.disabled = !willEnable); }
+            if(stationDiv) {
+                stationDiv.style.opacity = willEnable ? '1' : '0.5';
+                const inputs = stationDiv.querySelectorAll('input, button');
+                inputs.forEach(inp => inp.disabled = !willEnable);
+            }
             loadWiFiStatus();
-        } else { toast('Failed to toggle WiFi station', false); updateStaButton(wasEnabled); }
-    }).catch(()=>{ btn.disabled = false; toast('Error toggling WiFi station', false); updateStaButton(wasEnabled); });
+        } else {
+            toast('Failed to toggle WiFi station', false);
+            updateStaButton(wasEnabled);
+        }
+    }).catch(()=>{
+        btn.disabled = false;
+        toast('Error toggling WiFi station', false);
+        updateStaButton(wasEnabled);
+        setTimeout(loadWiFiStatus, 1000);
+    });
 }
+
 let scanTimer=null,scanning=false;
 function startScan(){
-    const staEnabled = document.getElementById('staToggleBtn').textContent === '✓ ON';
-    if(!staEnabled) { toast('Please enable WiFi Station Mode first', false); return; }
+    if(!isStaEnabled()) {
+        toast('Please enable WiFi Station Mode first', false);
+        return;
+    }
+    window._staDisabled = false;
     if(scanning)return;
     scanning=true;
     document.getElementById('scanBtn').textContent='\u23F3 Scanning\u2026';
@@ -1848,43 +2108,115 @@ function startScan(){
     const nl=document.getElementById('netlist');
     nl.style.display='block';
     nl.innerHTML='<div style="text-align:center;color:#90A4AE;padding:12px;font-size:13px">📡 Scanning for networks...</div>';
-    fetch('/api/wifi/scan',{method:'POST'}).then(()=>{ scanTimer=setInterval(pollScan,2500); }).catch(()=>endScan());
+    fetch('/api/wifi/scan',{method:'POST'})
+    .then(r => {
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    })
+    .then(()=>{ 
+        scanTimer=setInterval(pollScan,2500); 
+    })
+    .catch(()=>{
+        endScan();
+        toast('Scan failed \u2014 enable WiFi Station', false);
+        const nl2=document.getElementById('netlist');
+        if(nl2){ nl2.innerHTML=''; nl2.style.display='none'; }
+    });
 }
-function pollScan(){ fetch('/api/wifi/scan').then(r=>r.json()).then(d=>{ if(!d.scanning){clearInterval(scanTimer);endScan();renderNets(d.networks||[]);} }).catch(()=>{clearInterval(scanTimer);endScan();}); }
-function endScan(){ scanning=false; document.getElementById('scanBtn').textContent='\uD83D\uDCF6 Scan'; document.getElementById('scanBtn').disabled=false; }
+function pollScan(){
+    fetch('/api/wifi/scan').then(r=>{
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        return r.json();
+    }).then(d=>{
+        if(window._staDisabled){ return; }
+        if(!d.scanning){
+            if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+            endScan();
+            const nets = Array.isArray(d.networks) ? d.networks : [];
+            renderNets(nets);
+        }
+    }).catch(()=>{
+        if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+        endScan();
+        toast('Scan poll failed', false);
+    });
+}
+function endScan(){
+    scanning=false;
+    document.getElementById('scanBtn').textContent='\uD83D\uDCF6 Scan';
+    document.getElementById('scanBtn').disabled=false;
+}
 function renderNets(nets){
     const nl=document.getElementById('netlist');
-    if(!nets.length){nl.innerHTML='<div style="color:#90A4AE;text-align:center;padding:8px;font-size:13px">No networks found.</div>';return;}
+    if(!Array.isArray(nets) || nets.length===0){
+        nl.innerHTML='<div style="color:#90A4AE;text-align:center;padding:8px;font-size:13px">No networks found. Make sure WiFi is enabled.</div>';
+        return;
+    }
     const frag=document.createDocumentFragment();
     const hdr=document.createElement('div');hdr.className='net-hdr';hdr.textContent='Available Networks';frag.appendChild(hdr);
-    nets.sort((a,b)=>b.rssi-a.rssi).forEach(n=>{
+    const sorted = nets.slice().sort((a,b)=>(b.rssi||0)-(a.rssi||0));
+    sorted.forEach(n=>{
         const d=document.createElement('div');d.className='netitem';
         const ns=document.createElement('span');ns.className='ns';ns.textContent=n.ssid;
-        const nr=document.createElement('span');nr.className='nr';nr.textContent=n.rssi+'dBm';
-        const bar=document.createElement('span');bar.innerHTML=rssiBar(n.rssi);
+        const nr=document.createElement('span');nr.className='nr';nr.textContent=(n.rssi||0)+'dBm';
+        const bar=document.createElement('span');bar.innerHTML=rssiBar(n.rssi||0);
         const lock=document.createElement('span');lock.style.fontSize='13px';lock.textContent=n.enc?'\uD83D\uDD12':'';
         d.appendChild(ns);d.appendChild(nr);d.appendChild(bar);d.appendChild(lock);
-        d.addEventListener('click',()=>{document.getElementById('ssid').value=n.ssid;document.getElementById('pw').focus();});
+        d.addEventListener('click',()=>{
+            const ssidEl=document.getElementById('ssid');
+            const pwEl=document.getElementById('pw');
+            if(ssidEl && ssidEl.value !== n.ssid && pwEl) pwEl.value='';
+            if(ssidEl) ssidEl.value=n.ssid;
+            if(pwEl) pwEl.focus();
+        });
         frag.appendChild(d);
     });
     nl.innerHTML='';nl.appendChild(frag);
 }
 function saveWiFi(){
-    const staEnabled = document.getElementById('staToggleBtn').textContent === '✓ ON';
-    if(!staEnabled) { toast('Enable WiFi Station Mode first to save credentials', false); return; }
-    const ssid=document.getElementById('ssid').value.trim();
+    if(!isStaEnabled()) {
+        toast('Enable WiFi Station Mode first to save credentials', false);
+        return;
+    }
+    const ssidEl = document.getElementById('ssid');
+    const ssid=ssidEl.value.trim();
     if(!ssid){toast('SSID required',false);return;}
+    try {
+        if(new TextEncoder().encode(ssid).length > 31){toast('SSID must be 31 bytes or less',false);return;}
+    } catch(e) {
+        if(ssid.length > 31){toast('SSID must be 31 characters or less',false);return;}
+    }
+    const btn = document.querySelector('.bsave');
+    if(!btn || btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
     const body = {ssid: ssid};
     const pwVal = document.getElementById('pw').value;
     if (pwVal.length > 0) body.password = pwVal;
-    const btn = document.querySelector('.bsave');
-    btn.disabled = true; btn.textContent = 'Saving...';
+    const lastKnownSSID = (typeof window._lastSSID === 'string') ? window._lastSSID : '';
+    const ssidChanged = (ssid !== lastKnownSSID);
     fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(r=>r.json()).then(d=>{
-        btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save &amp; Connect';
-        if(d.success){ toast('Credentials saved! Reconnecting...'); setTimeout(()=>window.location.href='/',3000); }
-        else { toast('Failed: '+d.error, false); }
-    }).catch(()=>{ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save &amp; Connect'; toast('Error',false); });
+    .then(r=>{
+        if(!r.ok) return r.json().then(e=>Promise.reject(e));
+        return r.json();
+    }).then(d=>{
+        btn.disabled = false;
+        btn.innerHTML = '&#x1F4BE; Save &amp; Connect';
+        if(d.success){
+            if(ssidChanged){
+                toast('Credentials saved! Reconnecting...');
+                setTimeout(()=>window.location.href='/',3000);
+            } else {
+                toast('Settings saved.');
+            }
+        } else {
+            toast('Failed: '+(d.error||'Unknown'), false);
+        }
+    }).catch((e)=>{
+        btn.disabled = false;
+        btn.innerHTML = '&#x1F4BE; Save &amp; Connect';
+        toast('Error: '+((e && e.error) || 'request failed'), false);
+    });
 }
 loadWiFiStatus();
 </script></body></html>)raw";
@@ -1903,84 +2235,272 @@ const char ntp_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp" class="cur">Time</a>
 <a href="/ap">AP</a>
 <a href="/gpio">GPIO</a>
-<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
+<a href="/mqtt">MQTT</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">Time &amp; NTP Settings</p>
 <div class="card fcrd">
 <div id="timeStatus" class="alert ai" style="display:none;margin-bottom:12px"></div>
 <div class="fg">
+<label>Timezone</label>
+<select id="tz">
+<option value="">Loading&hellip;</option>
+</select>
+<small id="tzInfo">Auto-DST handled by firmware. Transitions detected within 5 seconds.</small>
+</div>
+<div class="fg">
+<label>Manual GMT Offset (seconds)</label>
+<input type="number" id="gmt" readonly style="background:#ECEFF1;color:#607D8B">
+<small>Read-only when a named timezone is selected. Select &quot;UTC&quot; and enter manual offset to override.</small>
+</div>
+<div class="fg">
 <label>NTP Server</label>
 <input type="text" id="srv" placeholder="time.google.com" required>
 <small>Fallbacks: time.google.com &rarr; time.windows.com &rarr; time.cloudflare.com &rarr; time.facebook.com</small>
 </div>
-<div class="fg"><label>GMT Offset (seconds)</label><input type="number" id="gmt" required></div>
-<div class="fg"><label>Daylight Saving (seconds)</label><input type="number" id="dst" value="0"></div>
 <div class="fg"><label>Auto Sync (hours, 1&ndash;24)</label><input type="number" id="shi" min="1" max="24" value="1"></div>
 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:stretch">
 <button class="btn bsave" style="flex:1;min-width:140px;margin-top:0;height:40px;padding:0 12px;background:#1565C0;color:#fff;border-radius:6px;font-size:13px;font-weight:600" onclick="save()">&#x1F4BE; Save Settings</button>
 <button class="btn bsync" id="sbtn" style="flex:1;min-width:120px;margin-top:0;height:40px;padding:0 12px;background:#1565C0;color:#fff;border-radius:6px;font-size:13px;font-weight:600;white-space:nowrap" onclick="sync()">&#x1F504; Sync NTP</button>
 <button class="btn bwarn" id="bsbtn" style="flex:1;min-width:130px;margin-top:0;height:40px;padding:0 12px;background:#1565C0;color:#fff;border-radius:6px;font-size:13px;font-weight:600;white-space:nowrap" onclick="syncFromBrowser()">&#x1F310; Sync Browser</button>
 </div>
-<small style="display:block;margin-top:12px;color:#90A4AE">Use <strong>Sync Browser</strong> when NTP servers are unreachable. <strong>DS3231 RTC Module</strong> maintains time across power cycles.</small>
+<small style="display:block;margin-top:12px;color:#90A4AE">Use <strong>Sync Browser</strong> when NTP servers are unreachable. <strong>NTP</strong> will automatically override browser time when available. <strong>DS3231 RTC Module</strong> is the primary time authority and maintains time across power cycles.</small>
 </div>
 </main>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}updateTimeStatus(d);}).catch(()=>{});}
+let lastNtpSyncAge = -1;
+function fmtOff(s){const h=Math.floor(Math.abs(s)/3600);const m=Math.floor((Math.abs(s)%3600)/60);return (s<0?'-':'+')+h+(m?':'+String(m).padStart(2,'0'):'');}
+function tick(){
+  fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}if(typeof d.ntpSyncAge === 'number' && d.ntpSyncAge !== 4294967295 && d.ntpSyncAge >= 0)lastNtpSyncAge=d.ntpSyncAge;updateTimeStatus(d);}).catch(()=>{});}
 function updateTimeStatus(d){
-  const s=document.getElementById('timeStatus'); s.style.display='block';
+  const s=document.getElementById('timeStatus');
+  s.style.display='block';
   let icon='',msg='',cls='ai';
-  if(d.timeSource==='ntp'){ icon='&#x2705;';msg='Time source: <strong>NTP Server</strong> — High Accuracy'; cls='ai'; }
-  else if(d.timeSource==='browser'){ icon='&#x1F310;';msg='Time source: <strong>Browser Sync</strong> — Moderate Accuracy'; cls='aw'; }
-  else if(d.timeSource==='rtc'){ icon='&#x1F4BF;';msg='Time source: <strong>DS3231 Real Time Clock</strong> — High Accuracy'; cls='ai'; }
-  else{ icon='&#x26A0;&#xFE0F;';msg='Time source: <strong>None</strong> — Please sync time'; cls='aw'; }
+  if(d.timeSource==='ntp'){
+    icon='&#x2705;';msg='Time source: <strong>NTP Server</strong> — High Accuracy';
+    cls='ai';
+  }else if(d.timeSource==='browser'){
+    icon='&#x1F310;';msg='Time source: <strong>Browser Sync</strong> — Moderate Accuracy';
+    cls='aw';
+  }else if(d.timeSource==='rtc'){
+    icon='&#x1F4BF;';msg='Time source: <strong>DS3231 Real Time Clock</strong> — High Accuracy';
+    cls='ai';
+  }else{
+    icon='&#x26A0;&#xFE0F;';msg='Time source: <strong>None</strong> — Please sync time';
+    cls='aw';
+  }
   let rtcInfo = '';
   if(d.rtcPresent){
     rtcInfo = '<br><small>✅ DS3231 RTC detected on GPIO8/9';
     if(d.rtcSynced){
-      if(d.rtcSyncAge === 4294967295 || d.rtcSyncAge < 0){
+      const age = (typeof d.rtcSyncAge === 'number') ? d.rtcSyncAge : -1;
+      if(age < 0 || age === 4294967295){
         rtcInfo += ' | Last sync: Never';
       } else {
-        rtcInfo += ' | Last sync: ' + d.rtcSyncAge + 's ago';
+        rtcInfo += ' | Last sync: ' + age + 's ago';
       }
     }
     rtcInfo += '</small>';
+  } else {
+    rtcInfo = '<br><small>⚠️ DS3231 RTC not detected</small>';
   }
-  else { rtcInfo = '<br><small>⚠️ DS3231 RTC not detected</small>'; }
-  s.innerHTML=icon+' '+msg+rtcInfo;
+  let dstInfo = '';
+  if(d.tzName){
+    const tzSafe = String(d.tzName).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    dstInfo = '<br><small>🌍 Timezone: <strong>' + tzSafe + '</strong>';
+    if(d.dstActive){
+      dstInfo += ' — <span style="color:#E65100;font-weight:700">DST ACTIVE</span>';
+    } else {
+      dstInfo += ' — Standard Time';
+    }
+    dstInfo += '</small>';
+  }
+  s.innerHTML=icon+' '+msg+rtcInfo+dstInfo;
   s.className='alert '+cls;
 }
 setInterval(tick,1000);tick();
-fetch('/api/ntp').then(r=>r.json()).then(d=>{
-  document.getElementById('srv').value=d.ntpServer??'time.google.com';
-  document.getElementById('gmt').value=d.gmtOffset??28800;
-  document.getElementById('dst').value=d.daylightOffset??0;
-  document.getElementById('shi').value=d.syncHours??1;
-}).catch(()=>{});
+
+let tzList = [];
+function loadTZ(){
+  fetch('/api/timezones').then(r=>r.json()).then(d=>{
+    tzList = d.timezones || [];
+    const sel = document.getElementById('tz');
+    sel.innerHTML = '';
+    tzList.forEach(z=>{
+      const o = document.createElement('option');
+      o.value = z.name;
+      o.textContent = z.name + ' (UTC' + fmtOff(z.offset) + (z.dst ? ' +DST' : '') + ')';
+      sel.appendChild(o);
+    });
+    const manualOpt = document.createElement('option');
+    manualOpt.value = 'Manual';
+    manualOpt.textContent = 'Manual Offset (custom GMT)';
+    sel.appendChild(manualOpt);
+    fetch('/api/ntp').then(r=>r.json()).then(cfg=>{
+      if (cfg.tzName && cfg.tzName !== 'Manual' && !tzList.some(z => z.name === cfg.tzName)) {
+        const o = document.createElement('option');
+        o.value = cfg.tzName;
+        o.textContent = cfg.tzName + ' (' + fmtOff(cfg.gmtOffset || 0) + ')';
+        sel.appendChild(o);
+      }
+      sel.value = cfg.tzName || 'UTC';
+      const gmtEl = document.getElementById('gmt');
+      if(gmtEl && typeof cfg.gmtOffset === 'number') gmtEl.value = cfg.gmtOffset;
+      const srvEl = document.getElementById('srv');
+      if(srvEl) srvEl.value = (typeof cfg.ntpServer === 'string' && cfg.ntpServer) ? cfg.ntpServer : 'time.google.com';
+      const shiEl = document.getElementById('shi');
+      if(shiEl) shiEl.value = (typeof cfg.syncHours === 'number' && cfg.syncHours >= 1 && cfg.syncHours <= 24) ? cfg.syncHours : 1;
+      updateTzInfo(cfg);
+      toggleGmtField();
+    }).catch(()=>{});
+  }).catch(()=>{
+    document.getElementById('tz').innerHTML = '<option value="UTC">UTC</option>';
+  });
+  const selEl = document.getElementById('tz');
+  if(selEl && !selEl._hasTzListener) {
+    selEl.addEventListener('change', toggleGmtField);
+    selEl._hasTzListener = true;
+  }
+}
+function updateTzInfo(cfg){
+  const info = document.getElementById('tzInfo');
+  if(cfg.tzAutoDst){
+    const dstH = (typeof cfg.dstOffset === 'number') ? (cfg.dstOffset/3600) : 0;
+    info.textContent = 'Auto-DST enabled. Current DST: ' +
+      (cfg.dstActive ? 'ACTIVE (+' + dstH + 'h)' : 'inactive') +
+      '. Transitions detected within 5 seconds.';
+  } else {
+    info.textContent = 'Manual offset mode. DST not applied automatically.';
+  }
+  const gmtEl = document.getElementById('gmt');
+  if(gmtEl && typeof cfg.gmtOffset === 'number') gmtEl.value = cfg.gmtOffset;
+}
+
+function toggleGmtField(){
+  const tzEl = document.getElementById('tz');
+  const gmtEl = document.getElementById('gmt');
+  const info = document.getElementById('tzInfo');
+  if(!tzEl || !gmtEl) return;
+  const tzVal = tzEl.value;
+  const isManual = (tzVal === 'Manual' || tzVal === '');
+  gmtEl.readOnly = !isManual;
+  gmtEl.style.background = isManual ? '#fff' : '#ECEFF1';
+  gmtEl.style.color = isManual ? '#1A1A2E' : '#607D8B';
+  if(isManual && info){
+    info.textContent = 'Manual offset mode. Enter GMT offset in seconds (e.g. 20700 = UTC+5:45). DST not applied automatically.';
+  }
+}
 function save(){
   const h=parseInt(document.getElementById('shi').value);
-  if(h<1||h>24){toast('Sync interval must be 1\u201324 h',false);return;}
-  fetch('/api/ntp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ntpServer:document.getElementById('srv').value,gmtOffset:parseInt(document.getElementById('gmt').value),daylightOffset:parseInt(document.getElementById('dst').value),syncHours:h})})
-  .then(r=>r.json()).then(d=>{if(d.success)toast('NTP settings saved!');else toast('Failed: '+d.error,false);})
-  .catch(()=>toast('Error',false));
+  if(isNaN(h)||h<1||h>24){toast('Sync interval must be 1\u201324 h',false);return;}
+  const srvVal = document.getElementById('srv').value.trim();
+  if(srvVal.length === 0){toast('NTP server cannot be empty', false); return;}
+  if(srvVal.length >= 48){toast('NTP server must be 47 characters or less', false); return;}
+  const body = {
+    ntpServer: srvVal,
+    syncHours: h
+  };
+  const tzVal = document.getElementById('tz').value;
+  if(tzVal === 'Manual' || tzVal === ''){
+    const gmtVal = parseInt(document.getElementById('gmt').value);
+    if(isNaN(gmtVal) || gmtVal < -50400 || gmtVal > 50400){
+      toast('GMT offset must be between -50400 and 50400 seconds', false);
+      return;
+    }
+    body.gmtOffset = gmtVal;
+  } else if(tzVal && tzVal.length > 0){
+    body.tzName = tzVal;
+  }
+  fetch('/api/ntp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      if(d.success){
+        toast('NTP settings saved!');
+        loadTZ();
+        tick();
+      } else {
+        toast('Failed: '+d.error,false);
+      }
+    }).catch(()=>toast('Error',false));
 }
-function sync(){ const b=document.getElementById('sbtn');b.disabled=true;b.textContent='Syncing\u2026';
-  fetch('/api/ntp/sync',{method:'POST'}).then(r=>r.json()).then(d=>{ b.disabled=false;b.innerHTML='&#x1F504; Sync NTP'; if(d.success)toast('Time synced via NTP!');else toast('Sync failed \u2014 check WiFi/NTP',false); }).catch(()=>{b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';toast('Error',false);}); }
+function sync(){
+  const b=document.getElementById('sbtn');
+  b.disabled=true;b.textContent='Syncing\u2026';
+  const preAge = lastNtpSyncAge;
+  const startTs = Date.now();
+  fetch('/api/ntp/sync',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(!d.success){
+      b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';
+      toast('Sync failed \u2014 ' + (d.error || 'check WiFi/NTP'), false);
+      return;
+    }
+    toast('NTP sync initiated\u2026');
+    let attempts = 0;
+    const poll = setInterval(()=>{
+      attempts++;
+      fetch('/api/time').then(r=>r.json()).then(t=>{
+        const age = (typeof t.ntpSyncAge !== 'number' || t.ntpSyncAge === 4294967295 || t.ntpSyncAge < 0) ? -1 : t.ntpSyncAge;
+        const preAgeSafe = (typeof preAge === 'number' && preAge >= 0) ? preAge : -1;
+        const isFresh = (t.timeSource === 'ntp') && (age >= 0) && (age < 15);
+        const isNewer = (preAgeSafe < 0) || (age >= 0 && age < preAgeSafe);
+        if(isFresh && isNewer){
+          clearInterval(poll);
+          b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';
+          toast('Time synced via NTP!');
+          tick();
+        } else if(attempts >= 20 || (Date.now() - startTs) > 35000){
+          clearInterval(poll);
+          b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';
+          toast('NTP sync did not complete \u2014 check network', false);
+        }
+      }).catch(()=>{});
+    }, 1000);
+  }).catch(()=>{
+    b.disabled=false;b.innerHTML='&#x1F504; Sync NTP';
+    toast('Error',false);
+  });
+}
 function syncFromBrowser(){
-  const b=document.getElementById('bsbtn'); b.disabled=true; b.textContent='Syncing from browser\u2026';
+  const b=document.getElementById('bsbtn');
+  b.disabled=true;
+  b.textContent='Syncing from browser\u2026';
   const utcEpoch = Math.floor(Date.now() / 1000);
-  fetch('/api/time/browser-sync', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({utc_epoch: utcEpoch}) })
-  .then(r => r.json()).then(d => {
-    b.disabled = false; b.innerHTML = '&#x1F310; Sync Browser';
-    if (d.success) { document.getElementById('clk').textContent = d.local_time; let msg = 'Time synced from browser! Local time: ' + d.local_time; if(d.rtc_synced) msg += ' | DS3231 updated'; toast(msg); tick(); }
-    else { toast('Sync failed: ' + (d.error || 'Unknown error'), false); }
-  }).catch(() => { b.disabled = false; b.innerHTML = '&#x1F310; Sync Browser'; toast('Error syncing time from browser', false); });
+  fetch('/api/time/browser-sync', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({utc_epoch: utcEpoch})
+  })
+  .then(r => r.json())
+  .then(d => {
+    b.disabled = false;
+    b.innerHTML = '&#x1F310; Sync Browser';
+    if (d.success) {
+      const clkEl = document.getElementById('clk');
+      const dateEl = document.getElementById('date');
+      const safeTime = (typeof d.local_time === 'string' && d.local_time) ? d.local_time : '--:--:--';
+      const safeDate = (typeof d.local_date === 'string' && d.local_date) ? d.local_date : '--/--/----';
+      const safeWday = (typeof d.weekday === 'string' && d.weekday) ? d.weekday : '';
+      if(clkEl) clkEl.textContent = safeTime;
+      if(dateEl) dateEl.textContent = (safeWday ? safeWday + ' ' : '') + safeDate;
+      let msg = 'Time synced from browser! Local time: ' + safeTime + (safeDate !== '--/--/----' ? ' ' + safeDate : '');
+      if(d.rtc_synced) msg += ' | DS3231 updated';
+      toast(msg);
+      tick();
+    } else {
+      toast('Sync failed: ' + (d.error || 'Unknown error'), false);
+    }
+  })
+  .catch(() => {
+    b.disabled = false;
+    b.innerHTML = '&#x1F310; Sync Browser';
+    toast('Error syncing time from browser', false);
+  });
 }
+loadTZ();
 </script></body></html>)raw";
 
 // =============================================================================
@@ -1997,17 +2517,19 @@ const char ap_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp">Time</a>
 <a href="/ap" class="cur">AP</a>
 <a href="/gpio">GPIO</a>
-<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
+<a href="/mqtt">MQTT</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">Access Point Settings</p>
 <div class="card fcrd">
+<form onsubmit="return false" autocomplete="off">
 <div class="alert aw">&#x26A0;&#xFE0F; Changing SSID, Password, Channel or Visibility will restart the AP and disconnect all clients. Reconnect to the new SSID afterward.</div>
 <div class="fg"><label>AP SSID</label><input type="text" id="ssid" maxlength="31" required></div>
-<div class="fg"><label>AP Password</label><input type="password" id="pw" minlength="8" placeholder="Enter wifi password"></div>
+<div class="fg"><label>AP Password</label><input type="password" id="pw" minlength="8" maxlength="31" placeholder="Leave blank to keep current password"></div>
+<div class="fg" style="margin-top:-6px"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;text-transform:none;font-size:13px;font-weight:500;color:#1A1A2E"><input type="checkbox" id="clearPw" style="width:auto;margin:0"> Remove password (make AP open)</label></div>
 <div class="fg">
 <label>Channel (1&ndash;13)</label>
 <select id="ch">
@@ -2026,33 +2548,130 @@ const char ap_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <option value="1">Hidden (do not broadcast)</option>
 </select>
 </div>
-<button class="btn bsave" onclick="save()">&#x1F4BE; Save Settings</button>
+<button type="button" class="btn bsave" onclick="save()" id="apSaveBtn">&#x1F4BE; Save Settings</button>
+</form>
 </div>
 </main>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+function escapeHtml(text){const d=document.createElement('div');d.textContent=String(text==null?'':text);return d.innerHTML;}
+let savingAP = false;
+function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
 fetch('/api/ap').then(r=>r.json()).then(d=>{
   document.getElementById('ssid').value=d.ap_ssid||'';
   document.getElementById('ch').value=d.ap_channel||6;
   document.getElementById('hidden').value=d.ap_hidden?'1':'0';
+  const pwEl = document.getElementById('pw');
+  const clearEl = document.getElementById('clearPw');
+  if(pwEl) pwEl.addEventListener('input', function(){ if(this.value.length > 0 && clearEl) clearEl.checked = false; });
+  if(clearEl) clearEl.addEventListener('change', function(){ if(this.checked && pwEl) pwEl.value = ''; });
 }).catch(()=>{});
 function save(){
-  const pw=document.getElementById('pw').value;
-  if(pw.length>0&&pw.length<8){toast('Password must be 8+ chars or blank',false);return;}
-const body = {
-    ap_ssid:document.getElementById('ssid').value,
-    ap_channel:parseInt(document.getElementById('ch').value),
-    ap_hidden:document.getElementById('hidden').value==='1'
-};
-if (pw.length > 0) body.ap_password = pw;
-fetch('/api/ap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-  .then(r=>r.json()).then(d=>{
-    if(d.success){toast('Settings saved!');if(d.restarted)toast('AP restarted - reconnect to new network');setTimeout(()=>location.reload(),4000);}
-    else toast('Failed: '+d.error,false);
-  }).catch(()=>toast('Error',false));
+  if(savingAP) return;
+  const btn = document.getElementById('apSaveBtn') || document.querySelector('.bsave');
+
+  const ssidEl = document.getElementById('ssid');
+  const ssid = (ssidEl.value || '').trim();
+  if(!ssid){ toast('SSID cannot be empty', false); return; }
+  if(ssid.length > 31){ toast('SSID must be 31 characters or less', false); return; }
+  try {
+    if(new TextEncoder().encode(ssid).length > 31){ toast('SSID too long (max 31 bytes)', false); return; }
+  } catch(e) {}
+
+  const pwEl = document.getElementById('pw');
+  const pw = pwEl.value || '';
+  const clearPwEl = document.getElementById('clearPw');
+  const shouldClear = !!(clearPwEl && clearPwEl.checked);
+
+  if(!shouldClear && pw.length > 0 && pw.length < 8){
+    toast('Password must be 8+ characters or blank', false);
+    return;
+  }
+  if(pw.length > 31){
+    toast('Password must be 31 characters or less', false);
+    return;
+  }
+  if(shouldClear && pw.length > 0){
+    toast('Uncheck "Remove password" or clear the password field', false);
+    return;
+  }
+
+  const body = {
+    ap_ssid: ssid,
+    ap_channel: parseInt(document.getElementById('ch').value) || 6,
+    ap_hidden: document.getElementById('hidden').value === '1'
+  };
+
+  if(shouldClear){
+    body.ap_password = '';
+  } else if(pw.length > 0){
+    body.ap_password = pw;
+  }
+
+  savingAP = true;
+  if(btn){ btn.disabled = true; btn.textContent = 'Saving...'; }
+
+  let controller;
+  let timeoutId;
+  try {
+    controller = new AbortController();
+    timeoutId = setTimeout(() => controller.abort(), 15000);
+  } catch(err) {
+    savingAP = false;
+    if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+    toast('Error: browser does not support required features', false);
+    return;
+  }
+
+  fetch('/api/ap', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+    signal: controller.signal
+  })
+  .then(r => {
+    if(timeoutId !== undefined) clearTimeout(timeoutId);
+    if(!r.ok){
+      return r.json().then(e => Promise.reject(e)).catch(() => Promise.reject({error:'HTTP '+r.status}));
+    }
+    return r.json();
+  })
+  .then(d => {
+    savingAP = false;
+    if(!d || typeof d !== 'object' || Array.isArray(d)){
+      toast('Error: invalid response from device', false);
+      if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+      return;
+    }
+    if(d.success){
+      if(d.restarted){
+        toast('AP restarted \u2014 reconnect to new network', false);
+        document.body.innerHTML = '<div style="text-align:center;padding:60px 20px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#EEF2F7;min-height:100vh;box-sizing:border-box">'
+          + '<div style="background:#fff;max-width:420px;margin:0 auto;border-radius:12px;padding:32px 24px;box-shadow:0 4px 20px rgba(0,0,0,.1)">'
+          + '<h2 style="color:#1565C0;margin:0 0 16px;font-size:20px">\u2705 AP Settings Saved</h2>'
+          + '<p style="font-size:15px;color:#37474F;margin:0 0 20px">The Access Point has been restarted.</p>'
+          + '<p style="font-size:14px;color:#607D8B;margin:0 0 8px">Reconnect to:</p>'
+          + '<p style="font-size:18px;font-weight:700;color:#1565C0;margin:0 0 20px;word-break:break-word">' + escapeHtml(ssid) + '</p>'
+          + '<p style="font-size:14px;color:#607D8B;margin:0 0 8px">Then open:</p>'
+          + '<p style="font-size:16px;font-weight:700;margin:0"><a href="http://192.168.4.1/" style="color:#1565C0;text-decoration:none">192.168.4.1</a></p>'
+          + '</div></div>';
+      } else {
+        toast('Settings saved!');
+        if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+      }
+    } else {
+      toast('Failed: ' + (d.error || 'Unknown error'), false);
+      if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+    }
+  })
+  .catch((e) => {
+    if(timeoutId !== undefined) clearTimeout(timeoutId);
+    savingAP = false;
+    toast('Error: ' + ((e && e.error) || 'request failed'), false);
+    if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
+  });
 }
 </script></body></html>)raw";
 
@@ -2070,15 +2689,17 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/ntp">Time</a>
 <a href="/ap">AP</a>
 <a href="/gpio" class="cur">GPIO</a>
-<a href="/mqtt">MQTT</a>
 <a href="/system">System</a>
+<a href="/mqtt">MQTT</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">GPIO Pin Configuration</p>
+
 <div class="card fcrd">
 <div class="alert ai">Configure which GPIO pins control your relays and set active level. Changes take effect immediately.</div>
+
 <div class="fg">
 <label>Global Active Level Mode</label>
 <select id="globalMode" onchange="saveGlobalMode()">
@@ -2086,22 +2707,29 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <option value="1">Global: All Relays Active LOW</option>
 <option value="2">Global: All Relays Active HIGH</option>
 </select>
-<small>Global mode overrides individual relay active level settings.</small>
+<small>Global mode overrides individual relay active level settings. Active LOW means relay activates when pin is LOW. Active HIGH means relay activates when pin is HIGH.</small>
 </div>
+
 <hr>
+
 <div class="fg">
 <label>Add New Relay Pin</label>
 <div class="input-row">
-<select id="newPin"><option value="">Select GPIO...</option></select>
+<select id="newPin">
+<option value="">Select GPIO...</option>
+</select>
 <button class="btn bsave" onclick="addPin()" style="margin-top:0;width:auto;padding:9px 20px">+ Add Relay</button>
 </div>
 <small>Only available GPIOs are shown.</small>
 </div>
+
 <hr>
+
 <div id="pinList">
 <h3 style="margin-bottom:10px">Configured Relays (<span id="relayCount">0</span>)</h3>
 <div id="pins"></div>
 </div>
+
 <div style="margin-top:16px">
 <button class="btn bsave" onclick="resetDefaults()" style="margin-top:0;width:100%;padding:9px 20px;background:#1565C0;color:#fff;font-size:13px;font-weight:600;border-radius:6px">&#x1F504; Reset to Default</button>
 </div>
@@ -2110,86 +2738,161 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
-// change gpio 
+// change gpio
 const DEFAULT_PINS = [4,5,6,7,11,12,13,14,1,2,42,41,47,21,20,19];
 let gpioData = null;
 function saveGlobalMode() {
     const mode = parseInt(document.getElementById('globalMode').value);
-    fetch('/api/gpio/global-mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: mode}) })
-    .then(r=>r.json()).then(d=>{ if(d.success) { toast('Global active mode updated!'); loadGPIO(); } else { toast('Failed: '+d.error, false); } })
-    .catch(()=>toast('Error', false));
+    fetch('/api/gpio/global-mode', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mode: mode})
+    }).then(r=>r.json()).then(d=>{
+        if(d.success) {
+            toast('Global active mode updated!');
+            loadGPIO(); 
+        } else {
+            toast('Failed: '+d.error, false);
+        }
+    }).catch(()=>toast('Error', false));
 }
+
 function renderGPIOPins(d) {
     const globalMode = parseInt(document.getElementById('globalMode').value);
     const isGlobalMode = (globalMode === 1 || globalMode === 2);
     const globalModeText = (globalMode === 1) ? 'GLOBAL ACTIVE LOW' : (globalMode === 2) ? 'GLOBAL ACTIVE HIGH' : null;
+    
     let pinsHtml = '';
     if(isGlobalMode) {
         pinsHtml = `<div style="background:#FFF3E0;padding:10px;border-radius:7px;margin-bottom:12px;border-left:4px solid #F9A825">
             <strong style="color:#E65100">⚠️ Global Mode Active:</strong> ${globalModeText}<br>
-            <small style="color:#BF360C">Individual active level settings are currently overridden.</small>
+            <small style="color:#BF360C">Individual active level settings are currently overridden. Switch to "Per-Relay Configuration" to use individual settings.</small>
         </div>`;
     }
+    
     for(let i=0; i<d.count; i++) {
         const activeLow = d.activeLow ? d.activeLow[i] : true;
         pinsHtml += `<div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid #E3E8EF;border-radius:7px;margin-bottom:6px;background:#FAFAFA">
             <span style="font-weight:700;min-width:60px">Relay ${i+1}</span>
             <span style="flex:1">GPIO <strong>${d.pins[i]}</strong></span>
             <span style="flex:1;font-size:12px">Active: <strong>${activeLow ? 'LOW' : 'HIGH'}</strong></span>
-            <button class="btn ${activeLow ? 'bon-b' : 'boff-b'}" onclick="toggleActiveLow(${i})" style="padding:5px 10px;font-size:11px" title="Toggle active level" ${isGlobalMode ? 'disabled' : ''}>
+            <button class="btn ${activeLow ? 'bon-b' : 'boff-b'}" 
+                onclick="toggleActiveLow(${i})" 
+                style="padding:5px 10px;font-size:11px" 
+                title="Toggle active level"
+                ${isGlobalMode ? 'disabled' : ''}>
                 ${activeLow ? 'Set HIGH' : 'Set LOW'}
             </button>
             <button class="btn boff-b" onclick="deletePin(${i})" style="padding:5px 10px;font-size:11px" title="Remove this relay">&#x1F5D1; Remove</button>
         </div>`;
     }
-    if(d.count === 0) pinsHtml += '<div style="color:#90A4AE;text-align:center;padding:20px">No relays configured.</div>';
+    if(d.count === 0) pinsHtml += '<div style="color:#90A4AE;text-align:center;padding:20px">No relays configured. Add some using the dropdown above.</div>';
     if(d.count >= 16) pinsHtml += '<div style="color:#E65100;text-align:center;padding:10px;font-size:12px">Maximum 16 relays reached.</div>';
     document.getElementById('pins').innerHTML = pinsHtml;
+    
     const select = document.getElementById('newPin');
     select.innerHTML = '<option value="">Select GPIO...</option>';
     const usedPins = new Set(d.pins.slice(0, d.count));
-    d.availablePins.forEach(pin => { if(!usedPins.has(pin)) { select.innerHTML += `<option value="${pin}">GPIO ${pin}</option>`; } });
-    if(select.options.length === 1) { select.innerHTML += '<option value="" disabled>All available pins in use</option>'; }
+    d.availablePins.forEach(pin => {
+        if(!usedPins.has(pin)) {
+            select.innerHTML += `<option value="${pin}">GPIO ${pin}</option>`;
+        }
+    });
+    if(select.options.length === 1) {
+        select.innerHTML += '<option value="" disabled>All available pins in use</option>';
+    }
 }
+
 function loadGPIO() {
     fetch('/api/gpio').then(r=>r.json()).then(d=>{
         gpioData = d;
         document.getElementById('relayCount').textContent = d.count;
-        fetch('/api/gpio/global-mode').then(r=>r.json()).then(data=>{ if(data.mode !== undefined) { document.getElementById('globalMode').value = data.mode; } renderGPIOPins(d); }).catch(()=>{ renderGPIOPins(d); });
+        
+        fetch('/api/gpio/global-mode').then(r=>r.json()).then(data=>{
+            if(data.mode !== undefined) {
+                document.getElementById('globalMode').value = data.mode;
+            }
+            renderGPIOPins(d);
+        }).catch(()=>{
+            renderGPIOPins(d);
+        });
     }).catch(()=>toast('Error loading GPIO config',false));
 }
+
 function toggleActiveLow(index) {
-    fetch('/api/gpio/toggle-active-low', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index:index}) })
-    .then(r=>r.json()).then(d=>{ if(d.success) { toast('Active level: ' + (d.activeLow ? 'LOW' : 'HIGH')); loadGPIO(); } else { toast('Failed: '+d.error, false); } })
-    .catch(()=>toast('Error',false));
+    fetch('/api/gpio/toggle-active-low', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({index:index})
+    }).then(r=>r.json()).then(d=>{
+        if(d.success) {
+            toast('Active level: ' + (d.activeLow ? 'LOW' : 'HIGH'));
+            loadGPIO();
+        } else {
+            toast('Failed: '+d.error, false);
+        }
+    }).catch(()=>toast('Error',false));
 }
+
 function addPin() {
-    const pin = parseInt(document.getElementById('newPin').value);
-    if(!pin) return;
-    fetch('/api/gpio/add', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pin:pin}) })
-    .then(r=>r.json()).then(d=>{ if(d.success) { toast('Relay added on GPIO '+pin+'!'); loadGPIO(); } else { toast('Failed: '+d.error, false); } })
-    .catch(()=>toast('Error',false));
+    const rawVal = document.getElementById('newPin').value;
+    if(rawVal === '') return;
+    const pin = parseInt(rawVal);
+    if(isNaN(pin)) return;
+    
+    fetch('/api/gpio/add', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({pin:pin})
+    }).then(r=>r.json()).then(d=>{
+        if(d.success) {
+            toast('Relay added on GPIO '+pin+'!');
+            loadGPIO();
+        } else {
+            toast('Failed: '+d.error, false);
+        }
+    }).catch(()=>toast('Error',false));
 }
+
 function deletePin(index) {
     if(!confirm('Remove Relay ' + (index+1) + ' from GPIO ' + gpioData.pins[index] + '?\n\nAll schedules for this relay will be lost and numbering will shift.')) return;
-    fetch('/api/gpio/delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({index:index}) })
-    .then(r=>r.json()).then(d=>{ if(d.success) { toast('Relay removed!'); loadGPIO(); } else { toast('Failed: '+d.error, false); } })
-    .catch(()=>toast('Error',false));
+    
+    fetch('/api/gpio/delete', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({index:index})
+    }).then(r=>r.json()).then(d=>{
+        if(d.success) {
+            toast('Relay removed!');
+            loadGPIO();
+        } else {
+            toast('Failed: '+d.error, false);
+        }
+    }).catch(()=>toast('Error',false));
 }
+
 function resetDefaults() {
     if(!confirm('Reset to default 16 GPIO pins?\n\nThis will restore all original pin mappings but preserve your schedule settings where possible.')) return;
-    fetch('/api/gpio/save', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({pins:DEFAULT_PINS}) })
-    .then(r=>r.json()).then(d=>{ if(d.success) { toast('Reset to default 16 pins!'); loadGPIO(); } else { toast('Failed: '+d.error, false); } })
-    .catch(()=>toast('Error',false));
+    
+    fetch('/api/gpio/save', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({pins:DEFAULT_PINS})
+    }).then(r=>r.json()).then(d=>{
+        if(d.success) {
+            toast('Reset to default 16 pins!');
+            loadGPIO();
+        } else {
+            toast('Failed: '+d.error, false);
+        }
+    }).catch(()=>toast('Error',false));
 }
+
 loadGPIO();
 </script></body></html>)raw";
 
-// =============================================================================
-//  SYSTEM PAGE
-// =============================================================================
 const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>System</title>
@@ -2204,7 +2907,7 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <a href="/mqtt">MQTT</a>
 <a href="/system" class="cur">System</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
 <p class="ptitle">System Information &amp; Settings</p>
@@ -2215,6 +2918,8 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div class="ibox"><div class="l">Uptime</div><div class="v" id="sup">&hellip;</div></div>
 <div class="ibox"><div class="l">WiFi RSSI</div><div class="v" id="srs">&hellip;</div></div>
 <div class="ibox"><div class="l">Time Source</div><div class="v" id="stsrc" style="font-size:13px">&hellip;</div></div>
+<div class="ibox"><div class="l">Timezone</div><div class="v" id="stz" style="font-size:13px">&hellip;</div></div>
+<div class="ibox"><div class="l">DST Status</div><div class="v" id="sdst" style="font-size:13px">&hellip;</div></div>
 <div class="ibox"><div class="l">UTC Epoch</div><div class="v" id="sutc" style="font-size:11px">&hellip;</div></div>
 <div class="ibox"><div class="l">NTP Last Sync</div><div class="v" id="snt">&hellip;</div></div>
 <div class="ibox"><div class="l">Last Browser Sync</div><div class="v" id="sbs">&hellip;</div></div>
@@ -2230,8 +2935,9 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div class="ibox"><div class="l">DS3231 Temp</div><div class="v" id="srtctemp">&hellip;</div></div>
 <div class="ibox"><div class="l">Sync Direction</div><div class="v" id="ssyncdir" style="font-size:12px;color:#7B1FA2">&hellip;</div></div>
 <div class="ibox"><div class="l">WiFi Station</div><div class="v" id="stawifi">&hellip;</div></div>
-<div class="ibox"><div class="l">MQTT</div><div class="v" id="smqtt">&hellip;</div></div>
+<div class="ibox"><div class="l">MQTT <a href="/mqtt" style="font-size:10px;color:#1565C0">Configure</a></div><div class="v" id="smqtt" style="font-size:12px">&hellip;</div></div>
 </div>
+
 <div class="card fcrd">
 <p style="font-weight:700;margin-bottom:12px">Device Control</p>
 <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center">
@@ -2244,235 +2950,432 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+
+function tick(){
+  fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
+    if(!d || typeof d !== 'object') return;
+    const clkEl = document.getElementById('clk');
+    if(clkEl) clkEl.textContent = (typeof d.time === 'string' && d.time) ? d.time : '--:--:--';
+    const de = document.getElementById('date');
+    if(de){
+      const wk = (typeof d.weekday === 'string' && d.weekday) ? d.weekday + ' ' : '';
+      const dt = (typeof d.date === 'string' && d.date) ? d.date : '--/--/----';
+      de.textContent = wk + dt;
+    }
+    const w = document.querySelector('.wd');
+    const t = document.querySelector('.td');
+    if(w) w.className = 'dot ' + (d.wifi ? 'g' : 'r');
+    if(t){
+      let tc = 'y';
+      if(d.timeSource === 'ntp') tc = 'g';
+      else if(d.timeSource === 'browser') tc = 'y';
+      else if(d.timeSource === 'rtc') tc = 'g';
+      else if(d.timeSource === 'ds3231') tc = 'g';
+      else if(d.timeSource === 'internal rtc') tc = 'g';
+      else tc = 'y';
+      t.className = 'dot ' + tc;
+    }
+  }).catch(()=>{});
+}
 setInterval(tick,1000);tick();
+
 function fmtUp(s){
-  const d = Math.floor(s / 86400); const h = Math.floor((s % 86400) / 3600);
-  const m = Math.floor((s % 3600) / 60); const ss = s % 60;
+  if(typeof s !== 'number' || !isFinite(s) || s < 0) s = 0;
+  s = Math.floor(s);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
   if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
   if (h > 0) return h + 'h ' + m + 'm ' + ss + 's';
   if (m > 0) return m + 'm ' + ss + 's';
   return ss + 's';
 }
-function fmtAge(s){if(s===4294967295||s<0)return'Never';if(s<60)return'Just now';if(s<3600)return Math.floor(s/60)+' min ago';const h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m ago';}
-function rssiDesc(r){if(!r)return'\u2014';return r+'dBm ('+( r>=-50?'Excellent':r>=-60?'Good':r>=-70?'Fair':'Weak')+')';}
+
+function fmtAge(s){
+  if(typeof s !== 'number' || !isFinite(s) || s < 0 || s === 4294967295) return 'Never';
+  s = Math.floor(s);
+  if(s < 60) return 'Just now';
+  if(s < 3600) return Math.floor(s/60) + ' min ago';
+  const h = Math.floor(s/3600);
+  return h + 'h ' + Math.floor((s%3600)/60) + 'm ago';
+}
+
+function rssiDesc(r){
+  if(typeof r !== 'number' || !isFinite(r) || r === 0) return '\u2014';
+  return r + 'dBm (' + (r>=-50?'Excellent':r>=-60?'Good':r>=-70?'Fair':'Weak') + ')';
+}
+
+function formatGmtOffset(sec){
+  if(typeof sec !== 'number' || !isFinite(sec)) sec = 0;
+  const sign = sec >= 0 ? '+' : '-';
+  const absG = Math.abs(sec);
+  const gh = Math.floor(absG / 3600);
+  const gmn = Math.floor((absG % 3600) / 60);
+  const gss = absG % 60;
+  let s = 'UTC' + sign + gh;
+  if(gmn !== 0 || gss !== 0){
+    s += ':' + String(gmn).padStart(2, '0');
+    if(gss !== 0) s += ':' + String(gss).padStart(2, '0');
+  }
+  return s;
+}
+
+function safeAge(v){
+  return (typeof v === 'number' && isFinite(v) && v >= 0 && v !== 4294967295) ? Math.floor(v) : -1;
+}
+
 function loadSys(){
-  fetch('/api/system').then(r=>r.json()).then(d=>{
-    document.getElementById('sip').textContent=d.wifiConnected?d.ip:'(not connected)';
-    document.getElementById('sap').textContent=d.ap_ip;
-    document.getElementById('shp').textContent=(d.freeHeap/1024).toFixed(1)+' KB';
-    document.getElementById('sup').textContent=fmtUp(d.uptime);
-    document.getElementById('srs').textContent=d.wifiConnected?rssiDesc(d.rssi):'\u2014';
-    const tsrc=d.timeSource||'None';
-    let tsrcStyle='';
-    if(tsrc==='NTP')tsrcStyle='color:#2E7D32';
-    else if(tsrc==='Browser')tsrcStyle='color:#1565C0';
-    else if(tsrc==='RTC')tsrcStyle='color:#7B1FA2';
-    else tsrcStyle='color:#C62828';
-    document.getElementById('stsrc').style.cssText='font-size:13px;font-weight:700;'+tsrcStyle;
-    document.getElementById('stsrc').textContent=tsrc;
-    document.getElementById('sutc').textContent=d.utcEpoch||'\u2014';
-    document.getElementById('snt').textContent=d.ntpSyncAge>=0?fmtAge(d.ntpSyncAge):'Never';
-    document.getElementById('sbs').textContent=d.browserSyncAge>=0?fmtAge(d.browserSyncAge):'Never';
-    document.getElementById('sns').textContent=d.ntpServer||'\u2014';
-    document.getElementById('sch').textContent=d.chipModel||'ESP32S3';
-    document.getElementById('smdns').textContent=d.mdnsStarted ? d.mdnsHostname+'.local' : 'Not running';
-    document.getElementById('src').textContent=d.relayCount+' / '+d.maxRelays;
-    document.getElementById('sgmt').textContent=(d.gmtOffset/3600).toFixed(1)+'h (UTC'+(d.gmtOffset>=0?'+':'')+(d.gmtOffset/3600).toFixed(1)+')';
-    document.getElementById('sdrift').textContent=d.driftComp ? d.driftComp.toFixed(4) : '1.0000';
-    let modeText = '';
-    if(d.globalActiveMode === 1) modeText = '🌍 Global LOW';
-    else if(d.globalActiveMode === 2) modeText = '🌍 Global HIGH';
-    else modeText = '🔧 Per-Relay';
-    document.getElementById('sactmode').textContent = modeText;
-    document.getElementById('srtc').textContent = d.rtcPresent ? '✅ Present' : '❌ Not detected';
-    if(d.rtcPresent) document.getElementById('srtc').style.color='#2E7D32'; else document.getElementById('srtc').style.color='#C62828';
-    document.getElementById('srtcsync').textContent = d.rtcSyncAge >= 0 ? fmtAge(d.rtcSyncAge) : 'Never';
-    const tEl = document.getElementById('srtctemp');
-    if (d.rtcTemp === null || d.rtcTemp === undefined) { tEl.textContent = '\u2014'; tEl.style.color = '#90A4AE'; }
-    else {
-        tEl.textContent = d.rtcTemp.toFixed(2) + ' \u00B0C';
-        if (d.rtcTemp < 15) tEl.style.color = '#1565C0';
-        else if (d.rtcTemp < 35) tEl.style.color = '#2E7D32';
-        else if (d.rtcTemp < 50) tEl.style.color = '#F9A825';
-        else tEl.style.color = '#C62828';
+  fetch('/api/system').then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(d=>{
+    if(!d || typeof d !== 'object' || Array.isArray(d) || Object.keys(d).length === 0) return;
+
+    const sipEl = document.getElementById('sip');
+    if(sipEl) sipEl.textContent = (d.wifiConnected && typeof d.ip === 'string' && d.ip) ? d.ip : '(not connected)';
+
+    const sapEl = document.getElementById('sap');
+    if(sapEl) sapEl.textContent = (typeof d.ap_ip === 'string' && d.ap_ip) ? d.ap_ip : '\u2014';
+
+    const shpEl = document.getElementById('shp');
+    if(shpEl){
+      const fh = (typeof d.freeHeap === 'number' && isFinite(d.freeHeap)) ? d.freeHeap : 0;
+      shpEl.textContent = (fh/1024).toFixed(1) + ' KB';
     }
-    document.getElementById('ssyncdir').textContent = d.rtcPresent ? 'DS3231 → Internal RTC' : 'Not available';
-    const staStatus = d.staEnabled ? (d.wifiConnected ? '✅ Connected' : '⚠️ Enabled but disconnected') : '❌ Disabled';
-    document.getElementById('stawifi').textContent = staStatus;
-    if(d.staEnabled && d.wifiConnected) document.getElementById('stawifi').style.color='#2E7D32';
-    else if(d.staEnabled) document.getElementById('stawifi').style.color='#F9A825';
-    else document.getElementById('stawifi').style.color='#C62828';
-    fetch('/api/mqtt').then(r=>r.json()).then(m=>{
-        const el = document.getElementById('smqtt');
-        if(!m.enabled) { el.textContent = '❌ Disabled'; el.style.color = '#C62828'; }
-        else if(m.connected) { el.textContent = '✅ Connected'; el.style.color = '#2E7D32'; }
-        else { el.textContent = '⚠️ Enabled, no conn'; el.style.color = '#F9A825'; }
-    }).catch(()=>{});
-  }).catch(()=>{});
+
+    const supEl = document.getElementById('sup');
+    if(supEl) supEl.textContent = fmtUp(d.uptime);
+
+    const srsEl = document.getElementById('srs');
+    if(srsEl) srsEl.textContent = d.wifiConnected ? rssiDesc(d.rssi) : '\u2014';
+
+    const tsrcEl = document.getElementById('stsrc');
+    if(tsrcEl){
+      const tsrc = (typeof d.timeSource === 'string' && d.timeSource) ? d.timeSource : 'None';
+      let tsrcStyle = 'color:#C62828';
+      if(tsrc === 'NTP') tsrcStyle = 'color:#2E7D32';
+      else if(tsrc === 'Browser') tsrcStyle = 'color:#1565C0';
+      else if(tsrc === 'DS3231') tsrcStyle = 'color:#7B1FA2';
+      else if(tsrc === 'Internal RTC') tsrcStyle = 'color:#7B1FA2';
+      tsrcEl.style.cssText = 'font-size:13px;font-weight:700;' + tsrcStyle;
+      tsrcEl.textContent = tsrc;
+    }
+
+    const stzEl = document.getElementById('stz');
+    if(stzEl) stzEl.textContent = (typeof d.tzName === 'string' && d.tzName) ? d.tzName : '\u2014';
+
+    const dstEl = document.getElementById('sdst');
+    if(dstEl){
+      const dstSec = (typeof d.dstOffset === 'number' && isFinite(d.dstOffset)) ? d.dstOffset : 0;
+      if(d.dstActive){
+        const dstH = Math.round(dstSec/3600*100)/100;
+        dstEl.textContent = '🌞 ACTIVE (+' + dstH + 'h)';
+        dstEl.style.color = '#E65100';
+      } else {
+        dstEl.textContent = '❄️ Standard';
+        dstEl.style.color = '#1565C0';
+      }
+    }
+
+    const sutcEl = document.getElementById('sutc');
+    if(sutcEl){
+      const utcStr = (typeof d.utcEpoch === 'string') ? d.utcEpoch : String(d.utcEpoch || '');
+      sutcEl.textContent = (utcStr && utcStr !== '0') ? utcStr : '\u2014';
+    }
+
+    const sntEl = document.getElementById('snt');
+    if(sntEl){
+      const ntpAge = safeAge(d.ntpSyncAge);
+      sntEl.textContent = ntpAge >= 0 ? fmtAge(ntpAge) : 'Never';
+    }
+
+    const sbsEl = document.getElementById('sbs');
+    if(sbsEl){
+      const bsAge = safeAge(d.browserSyncAge);
+      sbsEl.textContent = bsAge >= 0 ? fmtAge(bsAge) : 'Never';
+    }
+
+    const snsEl = document.getElementById('sns');
+    if(snsEl) snsEl.textContent = (typeof d.ntpServer === 'string' && d.ntpServer) ? d.ntpServer : '\u2014';
+
+    const schEl = document.getElementById('sch');
+    if(schEl) schEl.textContent = (typeof d.chipModel === 'string' && d.chipModel) ? d.chipModel : 'ESP32S3';
+
+    const smdnsEl = document.getElementById('smdns');
+    if(smdnsEl){
+      if(d.mdnsStarted){
+        smdnsEl.textContent = (typeof d.mdnsHostname === 'string' && d.mdnsHostname) ? d.mdnsHostname + '.local' : '\u2014';
+      } else {
+        smdnsEl.textContent = 'Not running';
+      }
+    }
+
+    const srcEl = document.getElementById('src');
+    if(srcEl){
+      const rc = (typeof d.relayCount === 'number' && isFinite(d.relayCount)) ? d.relayCount : 0;
+      const mr = (typeof d.maxRelays === 'number' && isFinite(d.maxRelays)) ? d.maxRelays : 16;
+      srcEl.textContent = rc + ' / ' + mr;
+    }
+
+    const sgmtEl = document.getElementById('sgmt');
+    if(sgmtEl) sgmtEl.textContent = formatGmtOffset(d.gmtOffset);
+
+    const sdriftEl = document.getElementById('sdrift');
+    if(sdriftEl){
+      const dc = (typeof d.driftComp === 'number' && isFinite(d.driftComp) && d.driftComp > 0) ? d.driftComp : 1.0;
+      sdriftEl.textContent = dc.toFixed(4);
+    }
+
+    const sactEl = document.getElementById('sactmode');
+    if(sactEl){
+      let modeText = '🔧 Per-Relay';
+      if(d.globalActiveMode === 1) modeText = '🌍 Global LOW';
+      else if(d.globalActiveMode === 2) modeText = '🌍 Global HIGH';
+      sactEl.textContent = modeText;
+    }
+
+    const srtcEl = document.getElementById('srtc');
+    if(srtcEl){
+      srtcEl.textContent = d.rtcPresent ? '✅ Present' : '❌ Not detected';
+      srtcEl.style.color = d.rtcPresent ? '#2E7D32' : '#C62828';
+    }
+
+    const srtcsyncEl = document.getElementById('srtcsync');
+    if(srtcsyncEl){
+      const rtcAge = safeAge(d.rtcSyncAge);
+      srtcsyncEl.textContent = rtcAge >= 0 ? fmtAge(rtcAge) : 'Never';
+    }
+
+    const tEl = document.getElementById('srtctemp');
+    if(tEl){
+      if(d.rtcTemp === null || d.rtcTemp === undefined || typeof d.rtcTemp !== 'number' || !isFinite(d.rtcTemp)){
+        tEl.textContent = '\u2014';
+        tEl.style.color = '#90A4AE';
+      } else {
+        tEl.textContent = d.rtcTemp.toFixed(2) + ' \u00B0C';
+        if(d.rtcTemp < 0)        tEl.style.color = '#0D47A1';
+        else if(d.rtcTemp < 10)  tEl.style.color = '#1565C0';
+        else if(d.rtcTemp < 20)  tEl.style.color = '#0288D1';
+        else if(d.rtcTemp < 30)  tEl.style.color = '#2E7D32';
+        else if(d.rtcTemp < 40)  tEl.style.color = '#F9A825';
+        else if(d.rtcTemp < 50)  tEl.style.color = '#EF6C00';
+        else                     tEl.style.color = '#C62828';
+      }
+    }
+
+    const ssyncEl = document.getElementById('ssyncdir');
+    if(ssyncEl){
+      ssyncEl.textContent = (typeof d.syncDirection === 'string' && d.syncDirection) ? d.syncDirection : 'Not available';
+    }
+
+    const stawifiEl = document.getElementById('stawifi');
+    if(stawifiEl){
+      const staStatus = d.staEnabled ? (d.wifiConnected ? '✅ Connected' : '⚠️ Enabled but disconnected') : '❌ Disabled';
+      stawifiEl.textContent = staStatus;
+      if(d.staEnabled && d.wifiConnected) stawifiEl.style.color = '#2E7D32';
+      else if(d.staEnabled) stawifiEl.style.color = '#F9A825';
+      else stawifiEl.style.color = '#C62828';
+    }
+    const mqttEl=document.getElementById('smqtt');
+    if(mqttEl){
+      mqttEl.textContent=d.mqttEnabled?(d.mqttConnected?'Connected':('Enabled — '+(d.mqttStatus||'Waiting'))):'Disabled';
+      mqttEl.style.color=d.mqttConnected?'#2E7D32':(d.mqttEnabled?'#F9A825':'#78909C');
+    }
+  }).catch(()=>{
+    const el = document.getElementById('stsrc');
+    if(el && !el.textContent) el.textContent = '\u2014';
+  });
 }
-loadSys();setInterval(loadSys,5000);
+loadSys();
+setInterval(loadSys, 5000);
+
 function rst(){
-  if(!confirm('Verify all services without restarting?'))return;
-  fetch('/api/reset',{method:'POST'}).then(r=>r.json()).then(d=>{ if(d.success)toast('Services verified!'); else toast('Verification failed',false); }).catch(()=>toast('Error',false));
+  if(!confirm('Verify all services without restarting? This will check WiFi, web server, DNS, and mDNS.'))return;
+  fetch('/api/reset',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d && d.success)toast('Services verified!');
+    else toast('Verification failed',false);
+  }).catch(()=>toast('Error',false));
 }
+
 function fct(){
   if(!confirm('FACTORY RESET \u2014 ALL settings will be erased. Continue?'))return;
-  fetch('/api/factory-reset',{method:'POST'}).then(r=>r.json()).then(d=>{ if(d.success)toast('Factory reset complete'); else toast('Reset failed',false); }).catch(()=>{});
-  setTimeout(()=>window.location.href='/',7000);
+  fetch('/api/factory-reset',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d && d.success)toast('Factory reset complete');
+    else toast('Reset failed',false);
+  }).catch(()=>{});
+  setTimeout(()=>window.location.reload(),15000);
 }
 </script></body></html>)raw";
 
-// =============================================================================
-//  MQTT PAGE
-// =============================================================================
 const char mqtt_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MQTT</title>
 <link rel="stylesheet" href="/style.css"></head><body>
 <header>
 <nav>
-<a href="/">Relays</a>
-<a href="/wifi">WiFi</a>
-<a href="/ntp">Time</a>
-<a href="/ap">AP</a>
-<a href="/gpio">GPIO</a>
-<a href="/mqtt" class="cur">MQTT</a>
-<a href="/system">System</a>
+<a href="/">Relays</a><a href="/wifi">WiFi</a><a href="/ntp">Time</a><a href="/ap">AP</a>
+<a href="/gpio">GPIO</a><a href="/mqtt" class="cur">MQTT</a><a href="/system">System</a>
 </nav>
-<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span></div>
+<div class="hdr-r"><span class="dot wd"></span><span class="dot td"></span>&nbsp;<span id="clk">--:--:--</span><span id="date" style="font-size:11px;opacity:.85;margin-left:6px;white-space:nowrap">--/--/----</span></div>
 </header>
 <main>
-<p class="ptitle">MQTT Broker Settings</p>
-<div class="card fcrd">
-<div id="mqttStatus" class="alert ai" style="margin-bottom:12px"></div>
+<p class="ptitle">MQTT Broker &amp; Relay Integration</p>
+<div class="card fcrd" style="max-width:780px">
+<div class="alert aw"><strong>Network/security note:</strong> This firmware uses MQTT 3.1.1 over plain TCP (no TLS). MQTT credentials are stored in ESP32S3 NVS and are not returned by the settings API. Use a trusted LAN/VPN broker; do not expose the device or broker directly to the public internet. The existing device web UI has no login, so restrict access to trusted clients.</div>
+<div id="mqttStatus" class="alert ai" style="white-space:pre-line">Loading MQTT status…</div>
+
 <div class="fg">
-<label style="display:flex;align-items:center;justify-content:space-between;cursor:pointer">
-<span style="font-size:14px;font-weight:600">Enable MQTT</span>
-<button id="mqttToggle" class="btn" style="min-width:100px" onclick="toggleMQTT()">OFF</button>
+<label style="display:flex;align-items:center;gap:9px;cursor:pointer">
+<input type="checkbox" id="enabled" style="width:auto;transform:scale(1.15)">
+<span>Enable MQTT client</span>
 </label>
+<small>Requires Wi-Fi Station mode and a reachable broker. The local web UI/AP continues to work if MQTT is unavailable.</small>
 </div>
 <hr>
-<div class="fg"><label>Broker Host</label><input type="text" id="broker" placeholder="192.168.1.100 or mqtt.local"></div>
-<div class="fg"><label>Broker Port</label><input type="number" id="port" value="1883" min="1" max="65535"></div>
-<div class="fg"><label>Username (optional)</label><input type="text" id="username" placeholder="Leave empty for anonymous"></div>
-<div class="fg"><label>Password (optional)</label><input type="password" id="password" placeholder="Leave blank to keep current"></div>
-<div class="fg"><label>Client ID</label><input type="text" id="clientId" value="esp32s3_relay16" maxlength="31"></div>
-<div class="fg">
-<label>Base Topic</label>
-<input type="text" id="baseTopic" value="esp32s3/relay16" maxlength="47">
-<small>Commands will be published under this prefix</small>
+<div class="fg"><label>Broker host / IPv4 address</label><input type="text" id="brokerHost" maxlength="95" placeholder="broker.example.lan or 192.168.1.10" autocomplete="off"><small>Enter a hostname or IPv4 address only; do not include mqtt://, a path, or port here.</small></div>
+<div class="fg"><label>Broker TCP port</label><input type="number" id="port" min="1" max="65535" value="1883" inputmode="numeric"></div>
+<div class="fg"><label>Client ID</label><input type="text" id="clientId" maxlength="48" autocomplete="off"><small>A unique ID is generated for this ESP32S3 by default. Keep IDs unique if you configure multiple devices.</small></div>
+<div class="fg"><label>Username (optional)</label><input type="text" id="username" maxlength="63" autocomplete="username"></div>
+<div class="fg"><label>Password (optional)</label><input type="password" id="password" maxlength="63" placeholder="Leave blank to keep the saved password" autocomplete="new-password"><label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;margin-top:7px"><input type="checkbox" id="clearPassword" style="width:auto"> Clear saved password</label></div>
+<div class="fg"><label>Base topic</label><input type="text" id="baseTopic" maxlength="95" placeholder="esp32s3/relay16"><small>No wildcards (# or +), spaces, or leading/trailing slash. Relay topics are created under this prefix.</small></div>
+<div class="fg"><label>Keep-alive (seconds)</label><input type="number" id="keepAliveSec" min="15" max="300" value="45"></div>
+<div class="fg"><label>Reconnect interval (seconds)</label><input type="number" id="reconnectIntervalSec" min="2" max="300" value="15"><small>Fixed retry interval while Wi-Fi is connected and the broker is unavailable.</small></div>
+<div class="fg"><label>System telemetry interval (seconds)</label><input type="number" id="telemetryIntervalSec" min="0" max="3600" value="60"><small>Set to 0 to disable periodic system telemetry. A snapshot is also sent after each connection.</small></div>
+<div class="fg"><label>Command subscription QoS</label><select id="commandQoS"><option value="0">QoS 0 — at most once</option><option value="1">QoS 1 — at least once</option></select><small>QoS 1 may redeliver messages. To avoid duplicate toggles, TOGGLE commands are rejected when QoS 1 is configured; use explicit ON/OFF instead.</small></div>
+<div class="fg"><label>Last Will QoS</label><select id="willQoS"><option value="0">QoS 0</option><option value="1">QoS 1</option></select><small>The retained Last Will publishes <code>offline</code> to the availability topic if the connection drops unexpectedly; normal connections publish <code>online</code>.</small></div>
+<div class="fg"><label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0"><input type="checkbox" id="retainStates" style="width:auto"> Retain relay and telemetry state</label><small>Availability is retained regardless of this option. State publications use QoS 0 (PubSubClient limitation); subscriptions support QoS 0 or 1.</small></div>
+<div class="fg"><label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0"><input type="checkbox" id="haDiscovery" style="width:auto"> Home Assistant MQTT discovery</label><small>Publishes retained switch discovery entities for configured relays and removes old discovery records when the topic prefix or relay count changes.</small></div>
+<div class="fg"><label>Home Assistant discovery prefix</label><input type="text" id="discoveryPrefix" maxlength="47" value="homeassistant"><small>Usually <code>homeassistant</code>. Used only if discovery is enabled.</small></div>
+<div class="input-row" style="flex-wrap:wrap">
+<button class="btn bsave" id="saveBtn" onclick="saveConfig()" style="flex:1;min-width:150px;margin-top:0">&#x1F4BE; Save Settings</button>
+<button class="btn bscan" id="testBtn" onclick="testConnection()" style="flex:1;min-width:150px">&#x1F50C; Test Unsaved Settings</button>
+<button class="btn bwarn" id="reconnectBtn" onclick="reconnect()" style="flex:1;min-width:150px">&#x1F504; Reconnect</button>
 </div>
-<div class="fg"><label>Publish Interval (seconds, 1-60)</label><input type="number" id="pubInterval" value="5" min="1" max="60"></div>
-<div class="fg">
-<label>QoS Level</label>
-<select id="qos">
-<option value="0">0 - At most once</option>
-<option value="1">1 - At least once</option>
-</select>
 </div>
-<div class="fg">
-<label>Home Assistant Discovery</label>
-<select id="homeAssistant">
-<option value="0">Disabled</option>
-<option value="1">Enabled</option>
-</select>
-<small>Auto-discover relays in Home Assistant</small>
+
+<div class="card fcrd" style="max-width:780px;margin-top:14px">
+<p style="font-weight:700;margin-bottom:6px">Topic map</p>
+<p style="font-size:12px;color:#607D8B;margin-bottom:8px">Use the base topic as the namespace. Relay numbers are one-based and follow the current GPIO relay order.</p>
+<pre id="topicMap" style="white-space:pre-wrap;overflow-wrap:anywhere;background:#F4F7FA;padding:10px;border-radius:6px;font-size:12px"></pre>
+<p style="font-size:12px;color:#607D8B;margin-top:8px"><strong>Relay commands:</strong> publish <code>ON</code>/<code>OFF</code> (also <code>TRUE</code>/<code>FALSE</code> or <code>1</code>/<code>0</code>), <code>TOGGLE</code> (QoS 0 only), <code>AUTO</code>/<code>SCHEDULE</code>, or <code>STATUS</code>/<code>QUERY</code> to <code>relay/&lt;n&gt;/command</code>. <code>relay/all/command</code> controls all relays. JSON such as <code>{"state":"ON"}</code> is also accepted. Manual ON/OFF/TOGGLE set a manual override; AUTO/SCHEDULE returns that relay to its schedule. QoS 1 may redeliver; use explicit ON/OFF instead of TOGGLE. Replies are published to <code>command/response</code>. Do not retain relay command messages, or a broker may replay them after reconnect.</p>
 </div>
-<div class="fg"><label>HA Discovery Prefix</label><input type="text" id="haPrefix" value="homeassistant"></div>
-<button class="btn bsave" onclick="saveMQTT()">&#x1F4BE; Save MQTT Settings</button>
-</div>
-<div class="card fcrd" style="margin-top:16px;max-width:800px">
-<p style="font-weight:700;margin-bottom:10px">MQTT Topics Reference</p>
-<div style="font-family:monospace;font-size:12px;background:#FAFAFA;padding:12px;border-radius:6px;line-height:1.8">
-<div><strong>Subscribe (Commands):</strong></div>
-<div>• <span id="topicRelaySet" style="color:#1565C0">&lt;base&gt;/relay/N/set</span> — ON/OFF/1/0/true/false</div>
-<div>• <span id="topicRelayToggle" style="color:#1565C0">&lt;base&gt;/relay/N/toggle</span> — Toggle relay</div>
-<div>• <span id="topicRelayAuto" style="color:#1565C0">&lt;base&gt;/relay/N/auto</span> — Reset to auto mode</div>
-<div>• <span id="topicAllSet" style="color:#1565C0">&lt;base&gt;/all/set</span> — Control all relays</div>
-<div>• <span id="topicSchedule" style="color:#1565C0">&lt;base&gt;/schedule/N/set</span> — JSON schedule</div>
-<div>• <span id="topicSystem" style="color:#1565C0">&lt;base&gt;/system/status</span> — Request status</div>
-<div>• <span id="topicTimeSync" style="color:#1565C0">&lt;base&gt;/time/sync</span> — Sync time (NTP or epoch)</div>
-<br>
-<div><strong>Publish (Status):</strong></div>
-<div>• <span style="color:#2E7D32">&lt;base&gt;/relay/N/state</span> — ON / OFF</div>
-<div>• <span style="color:#2E7D32">&lt;base&gt;/relay/N/mode</span> — auto / manual</div>
-<div>• <span style="color:#2E7D32">&lt;base&gt;/relay/N/json</span> — JSON relay info</div>
-<div>• <span style="color:#2E7D32">&lt;base&gt;/relays/json</span> — All relays JSON</div>
-<div>• <span style="color:#2E7D32">&lt;base&gt;/system/json</span> — System info JSON</div>
-<div>• <span style="color:#2E7D32">&lt;base&gt;/status</span> — online / offline</div>
-</div>
+
+<div class="card fcrd" style="max-width:780px;margin-top:14px">
+<p style="font-weight:700;margin-bottom:8px">One-off generic publish</p>
+<div class="fg"><label>Topic suffix (appended to base topic)</label><input type="text" id="pubTopic" maxlength="95" value="diagnostics/manual" placeholder="diagnostics/manual"></div>
+<div class="fg"><label>Payload</label><textarea id="pubPayload" rows="3" maxlength="512" style="width:100%;padding:9px 12px;border:1px solid #CFD8DC;border-radius:7px;font:inherit;font-size:14px;background:#FAFAFA" placeholder="Message payload"></textarea><small>Maximum 512 UTF-8 bytes.</small></div>
+<div class="fg"><label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0"><input type="checkbox" id="pubRetain" style="width:auto"> Retain this one-off message</label></div>
+<button class="btn bscan" id="publishBtn" onclick="publishMessage()">Publish message</button>
+<p style="font-size:11px;color:#90A4AE;margin-top:7px">Publishing is available only while connected. Use only a topic suffix without wildcards. Do not retain messages on relay command topics; the broker may replay them and change relay states after reconnect.</p>
 </div>
 </main>
 <div id="toast"></div>
 <script>
-function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='b';else if(d.timeSource==='rtc')tc='b';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3500);}
+function tick(){fetch('/api/time').then(r=>r.json()).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser'||d.timeSource==='rtc')tc='b';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
-let mqttEnabled = false;
-function updateMQTTButton(enabled, connected) {
-    const btn = document.getElementById('mqttToggle');
-    if(enabled && connected) { btn.textContent = '✓ Connected'; btn.style.background = '#43A047'; btn.style.color = '#fff'; }
-    else if(enabled) { btn.textContent = '⚠ Enabled'; btn.style.background = '#F9A825'; btn.style.color = '#212121'; }
-    else { btn.textContent = '✗ Disabled'; btn.style.background = '#E53935'; btn.style.color = '#fff'; }
+function configBody(){return{
+  enabled:document.getElementById('enabled').checked,
+  brokerHost:document.getElementById('brokerHost').value,
+  port:Number(document.getElementById('port').value),
+  clientId:document.getElementById('clientId').value,
+  username:document.getElementById('username').value,
+  password:document.getElementById('password').value,
+  clearPassword:document.getElementById('clearPassword').checked,
+  baseTopic:document.getElementById('baseTopic').value,
+  keepAliveSec:Number(document.getElementById('keepAliveSec').value),
+  reconnectIntervalSec:Number(document.getElementById('reconnectIntervalSec').value),
+  telemetryIntervalSec:Number(document.getElementById('telemetryIntervalSec').value),
+  commandQoS:Number(document.getElementById('commandQoS').value),
+  willQoS:Number(document.getElementById('willQoS').value),
+  retainStates:document.getElementById('retainStates').checked,
+  haDiscovery:document.getElementById('haDiscovery').checked,
+  discoveryPrefix:document.getElementById('discoveryPrefix').value
+};}
+function updateTopicMap(){
+  const raw=document.getElementById('baseTopic').value.trim().replace(/^\/+|\/+$/g,'');
+  const b=raw||'<base>';
+  document.getElementById('topicMap').textContent=
+    b+'/availability  online/offline (retained)\n'+
+    b+'/relay/1/state  ON or OFF\n'+b+'/relay/1/mode  MANUAL or AUTO\n'+
+    b+'/relay/1/attributes  JSON (name, pin, active level, mode)\n'+
+    b+'/relay/+/command  ON / OFF / TOGGLE / AUTO / STATUS\n'+
+    b+'/relay/all/command  command all configured relays\n'+
+    b+'/command/response  JSON acknowledgement\n'+
+    b+'/state  aggregate relay JSON\n'+b+'/system/state  device telemetry\n'+
+    b+'/diagnostics/test  transient connection-test message';
 }
-function loadMQTTStatus() {
-    fetch('/api/mqtt').then(r=>r.json()).then(d=>{
-        document.getElementById('broker').value = d.broker || '';
-        document.getElementById('port').value = d.port || 1883;
-        document.getElementById('username').value = d.username || '';
-        document.getElementById('clientId').value = d.client_id || 'esp32s3_relay16';
-        document.getElementById('baseTopic').value = d.base_topic || 'esp32s3/relay16';
-        document.getElementById('pubInterval').value = d.publish_interval || 5;
-        document.getElementById('qos').value = d.qos || 0;
-        document.getElementById('homeAssistant').value = d.home_assistant || 0;
-        document.getElementById('haPrefix').value = d.ha_prefix || 'homeassistant';
-        mqttEnabled = d.enabled === 1 || d.enabled === true;
-        updateMQTTButton(mqttEnabled, d.connected);
-        const s = document.getElementById('mqttStatus');
-        if(mqttEnabled && d.connected) { s.innerHTML = '✓ <strong>Connected</strong> to ' + d.broker + ':' + d.port; s.className = 'alert ai'; }
-        else if(mqttEnabled) { s.innerHTML = '⚠ <strong>Enabled but not connected</strong> — Check broker settings'; s.className = 'alert aw'; }
-        else { s.innerHTML = '⛔ MQTT is <strong>disabled</strong>'; s.className = 'alert aw'; }
-        const base = d.base_topic || 'esp32s3/relay16';
-        document.getElementById('topicRelaySet').textContent = base + '/relay/N/set';
-        document.getElementById('topicRelayToggle').textContent = base + '/relay/N/toggle';
-        document.getElementById('topicRelayAuto').textContent = base + '/relay/N/auto';
-        document.getElementById('topicAllSet').textContent = base + '/all/set';
-        document.getElementById('topicSchedule').textContent = base + '/schedule/N/set';
-        document.getElementById('topicSystem').textContent = base + '/system/status';
-        document.getElementById('topicTimeSync').textContent = base + '/time/sync';
-    }).catch(()=>{});
+document.getElementById('baseTopic').addEventListener('input',updateTopicMap);
+document.getElementById('password').addEventListener('input',()=>{if(document.getElementById('password').value)document.getElementById('clearPassword').checked=false;});
+document.getElementById('clearPassword').addEventListener('change',()=>{if(document.getElementById('clearPassword').checked)document.getElementById('password').value='';});
+async function readJsonResponse(r){let d;try{d=await r.json();}catch(e){throw new Error('Invalid server response');}if(!r.ok||d.success===false)throw new Error(d.error||d.message||('HTTP '+r.status));return d;}
+function loadConfig(){
+  fetch('/api/mqtt').then(readJsonResponse).then(d=>{
+    document.getElementById('enabled').checked=!!d.enabled;
+    document.getElementById('brokerHost').value=d.brokerHost||'';
+    document.getElementById('port').value=d.port||1883;
+    document.getElementById('clientId').value=d.clientId||'';
+    document.getElementById('username').value=d.username||'';
+    document.getElementById('password').value='';
+    document.getElementById('password').placeholder=d.passwordSet?'Saved password stored — leave blank to keep it':'Optional; stored in device NVS';
+    document.getElementById('clearPassword').checked=false;
+    document.getElementById('baseTopic').value=d.baseTopic||'';
+    document.getElementById('keepAliveSec').value=d.keepAliveSec||45;
+    document.getElementById('reconnectIntervalSec').value=d.reconnectIntervalSec||15;
+    document.getElementById('telemetryIntervalSec').value=(d.telemetryIntervalSec===undefined?60:d.telemetryIntervalSec);
+    document.getElementById('commandQoS').value=d.commandQoS||0;
+    document.getElementById('willQoS').value=d.willQoS||0;
+    document.getElementById('retainStates').checked=!!d.retainStates;
+    document.getElementById('haDiscovery').checked=!!d.haDiscovery;
+    document.getElementById('discoveryPrefix').value=d.discoveryPrefix||'homeassistant';
+    updateTopicMap();
+  }).catch(e=>toast('Could not load MQTT settings: '+e.message,false));
 }
-function toggleMQTT() {
-    mqttEnabled = !mqttEnabled;
-    fetch('/api/mqtt/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled: mqttEnabled}) })
-    .then(r=>r.json()).then(d=>{
-        if(d.success) { toast('MQTT ' + (mqttEnabled ? 'enabled' : 'disabled')); setTimeout(loadMQTTStatus, 1000); }
-        else { toast('Failed: ' + (d.error || 'Unknown'), false); mqttEnabled = !mqttEnabled; }
-    }).catch(()=>{ toast('Error', false); mqttEnabled = !mqttEnabled; });
+function refreshStatus(){
+  fetch('/api/mqtt/status').then(readJsonResponse).then(d=>{
+    const el=document.getElementById('mqttStatus');
+    const online=!!d.connected;
+    el.className='alert '+(online?'ai':(d.enabled?'aw':'ai'));
+    const lines=[];
+    lines.push((online?'CONNECTED':(d.enabled?'NOT CONNECTED':'DISABLED'))+' — '+(d.status||'Unknown'));
+    lines.push('Wi-Fi Station: '+(d.wifiReady?'connected':'not connected'));
+    if(d.enabled)lines.push('Broker: '+(d.brokerHost||'(not configured)')+':'+d.port);
+    lines.push('Subscriptions: '+(d.subscriptionsReady?'subscribe request sent':(d.connected?'pending':'—'))+' · connections: '+d.connectionCount+' · subscribe failures: '+d.subscribeFailures+' · published: '+d.publishedCount+' · received: '+d.receivedCount);
+    if(d.lastError && d.lastError!=='Connected' && d.enabled)lines.push('Last detail: '+d.lastError);
+    el.textContent=lines.join('\n');
+  }).catch(()=>{
+    const el=document.getElementById('mqttStatus');
+    el.className='alert aw';
+    el.textContent='MQTT status unavailable — device API request failed.';
+  });
 }
-function saveMQTT() {
-    const body = {
-        broker: document.getElementById('broker').value,
-        port: parseInt(document.getElementById('port').value),
-        username: document.getElementById('username').value,
-        client_id: document.getElementById('clientId').value,
-        base_topic: document.getElementById('baseTopic').value,
-        publish_interval: parseInt(document.getElementById('pubInterval').value),
-        qos: parseInt(document.getElementById('qos').value),
-        home_assistant: parseInt(document.getElementById('homeAssistant').value),
-        ha_prefix: document.getElementById('haPrefix').value
-    };
-    const pwVal = document.getElementById('password').value;
-    if (pwVal.length > 0) body.password = pwVal;
-    fetch('/api/mqtt', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
-    .then(r=>r.json()).then(d=>{
-        if(d.success) { toast('MQTT settings saved!'); setTimeout(loadMQTTStatus, 1500); }
-        else { toast('Failed: ' + (d.error || 'Unknown'), false); }
-    }).catch(()=>toast('Error', false));
+async function saveConfig(){
+  const b=document.getElementById('saveBtn');b.disabled=true;
+  try{const d=await readJsonResponse(await fetch('/api/mqtt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(configBody())}));
+    document.getElementById('password').value='';document.getElementById('clearPassword').checked=false;
+    toast(d.changed===false?'No MQTT settings changed':'MQTT settings saved');loadConfig();refreshStatus();
+  }catch(e){toast('Save failed: '+e.message,false);}finally{b.disabled=false;}
 }
-loadMQTTStatus();
-setInterval(loadMQTTStatus, 10000);
+async function testConnection(){
+  const b=document.getElementById('testBtn');b.disabled=true;b.textContent='Testing…';
+  try{const d=await readJsonResponse(await fetch('/api/mqtt/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(configBody())}));
+    toast(d.message||'Broker test succeeded');
+  }catch(e){toast('Broker test failed: '+e.message,false);}finally{b.disabled=false;b.innerHTML='&#x1F50C; Test Unsaved Settings';refreshStatus();}
+}
+async function reconnect(){
+  const b=document.getElementById('reconnectBtn');b.disabled=true;
+  try{const d=await readJsonResponse(await fetch('/api/mqtt/reconnect',{method:'POST'}));toast(d.message||'Reconnect requested');}
+  catch(e){toast('Reconnect failed: '+e.message,false);}finally{b.disabled=false;refreshStatus();}
+}
+async function publishMessage(){
+  const b=document.getElementById('publishBtn');b.disabled=true;
+  try{const body={topic:document.getElementById('pubTopic').value,payload:document.getElementById('pubPayload').value,retain:document.getElementById('pubRetain').checked};
+    if(new TextEncoder().encode(body.payload).length>512){toast('Payload exceeds 512 UTF-8 bytes',false);return;}
+    const d=await readJsonResponse(await fetch('/api/mqtt/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}));toast(d.message||'Published');
+  }catch(e){toast('Publish failed: '+e.message,false);}finally{b.disabled=false;refreshStatus();}
+}
+loadConfig();refreshStatus();setInterval(refreshStatus,2500);
 </script></body></html>)raw";
 
 // =============================================================================
@@ -2496,6 +3399,7 @@ void checkBootButton() {
     if (bootButtonPressed && !factoryResetTriggered &&
         timeHasElapsed(now, bootButtonPressStart, FACTORY_RESET_HOLD)) {
         factoryResetTriggered = true;
+        mqttPrepareFactoryReset();
         preferences.begin(NVS_NAMESPACE, false);
         preferences.clear();
         preferences.end();
@@ -2516,6 +3420,8 @@ void loadGPIOConfig() {
                  (gpioConfig.count > 0) &&
                  (gpioConfig.count <= MAX_RELAYS);
     if (valid) {
+        // change gpio
+        static const uint8_t SAFE_PINS[] = {4, 5, 6, 7, 11, 12, 13, 14, 1, 2, 42, 41, 47, 21, 20, 19};
         for (uint8_t i = 0; i < gpioConfig.count; i++) {
             bool allowed = false;
             for (uint8_t sp : SAFE_PINS) {
@@ -2532,7 +3438,9 @@ void loadGPIOConfig() {
         gpioConfig.count = 16;
         gpioConfig.magic = GPIO_CONFIG_MAGIC;
         memcpy(gpioConfig.pins, DEFAULT_RELAY_PINS, sizeof(uint8_t) * 16);
-        for (int i = 0; i < MAX_RELAYS; i++) gpioConfig.activeLow[i] = true;
+        for (int i = 0; i < MAX_RELAYS; i++) {
+            gpioConfig.activeLow[i] = true;
+        }
         saveGPIOConfig();
     }
 }
@@ -2555,11 +3463,11 @@ void syncInternalRTC(uint64_t rawUtcEpoch, uint8_t source) {
     lastRTCRebase = nowMillis;
     rtcInitialized = true;
     if (source == TIME_SOURCE_BROWSER) {
-        timeSource = TIME_SOURCE_BROWSER;
         lastBrowserSync = nowMillis;
+        timeSource = TIME_SOURCE_BROWSER;
     } else {
-        timeSource = TIME_SOURCE_NTP;
         lastNTPSync = nowMillis;
+        timeSource = TIME_SOURCE_NTP;
         lastBrowserSync = 0;
     }
     ntpFailCount = 0;
@@ -2591,7 +3499,7 @@ void startNTPRequest(const char* server) {
     ntpPacketBuffer[45] = 0;
     ntpPacketBuffer[46] = 0;
     ntpPacketBuffer[47] = 0;
-    if (!ntpUDP.begin(0)) {
+    if (!ntpUDP.begin(2390)) {
         ntpAsyncStage = 3;
         ntpAsyncPhaseStart = millis();
         return;
@@ -2636,8 +3544,8 @@ void processNTPResponse() {
                 uint64_t bestDiff = UINT64_MAX;
                 for (int ci = 0; ci < 3; ci++) {
                     uint64_t candNtp = candidates[ci];
-                    if (candNtp < NTP_EPOCH_OFFSET) continue;
                     uint64_t candUnix = candNtp - NTP_EPOCH_OFFSET;
+                    if (candNtp < NTP_EPOCH_OFFSET) continue;
                     if (!VALID_UNIX_TIME_64(candUnix)) continue;
                     uint64_t d = (candNtp > currentNtp) ? (candNtp - currentNtp) : (currentNtp - candNtp);
                     if (d < bestDiff) {
@@ -2646,6 +3554,14 @@ void processNTPResponse() {
                     }
                 }
                 if (bestDiff != UINT64_MAX) {
+                    bool localTimeTrusted = (timeSource == TIME_SOURCE_NTP) ||
+                                            (timeSource == TIME_SOURCE_BROWSER) ||
+                                            (rtcPresent && rtcTimeValid);
+                    if (localTimeTrusted && bestDiff > 31536000ULL) {
+                        ntpUDP.stop();
+                        ntpAsyncStage = 3;
+                        return;
+                    }
                     ntpSecs64 = bestNtp;
                 } else {
                     uint64_t unixEra0 = ntpSecs64 - NTP_EPOCH_OFFSET;
@@ -2716,21 +3632,22 @@ void updateNTPSync() {
     }
 }
 
+// =============================================================================
+//  NTP SYNC INITIATION
+// =============================================================================
 void tryNTPSync() {
     if (!wifiConnected || !extConfig.sta_enabled) {
-        if (ntpAsyncStage == 0 || ntpAsyncStage == 1) {
-            ntpUDP.stop();
-        }
         ntpAsyncState = NTP_STATE_IDLE;
         ntpAsyncStage = 0;
-        ntpRetryCount = 0;
         return;
     }
     if (ntpAsyncStage != 0 || ntpAsyncState == NTP_STATE_CONNECTING) {
         return;
     }
     unsigned long now = millis();
-    if (!timeHasElapsed(now, lastNTPAttempt, NTP_RETRY_INTERVAL)) return;
+    if (lastNTPAttempt != 0 && !timeHasElapsed(now, lastNTPAttempt, NTP_RETRY_INTERVAL)) {
+        return;
+    }
     lastNTPAttempt = now;
     ntpRetryCount = 0;
     ntpAsyncStage = 0;
@@ -2742,13 +3659,15 @@ void tryNTPSync() {
 // =============================================================================
 void handleBrowserTimeSync() {
     if (!server.hasArg("plain")) {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"No data\"}");
         return;
     }
     StaticJsonDocument<256> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Bad JSON\"}");
         return;
     }
     uint64_t browserUtcEpoch = doc["utc_epoch"].as<uint64_t>();
@@ -2758,10 +3677,8 @@ void handleBrowserTimeSync() {
         return;
     }
     uint64_t currentEpoch = getCurrentEpoch();
-
     bool trustCurrentTime = false;
     unsigned long nowMs = millis();
-
     if (timeSource == TIME_SOURCE_NTP && lastNTPSync > 0 &&
         !timeHasElapsed(nowMs, lastNTPSync, 86400000UL)) {
         trustCurrentTime = true;
@@ -2775,7 +3692,6 @@ void handleBrowserTimeSync() {
         !timeHasElapsed(nowMs, lastBrowserSync, 86400000UL)) {
         trustCurrentTime = true;
     }
-
     if (trustCurrentTime && currentEpoch >= MIN_UNIX_TIME_64) {
         uint64_t diff = (browserUtcEpoch > currentEpoch)
             ? (browserUtcEpoch - currentEpoch)
@@ -2803,19 +3719,35 @@ void handleBrowserTimeSync() {
     updateScheduleCache();
     uint64_t localEpoch = getLocalEpoch(browserUtcEpoch);
     struct tm* ti = gmtime64(&localEpoch);
-    char timeStr[20];
+    char timeStr[12];
+    char dateStr[12];
+    char weekdayStr[4] = "";
+    static const char* WD[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
     if (ti) {
-        snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d:%02d",
-                 ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday,
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
                  ti->tm_hour, ti->tm_min, ti->tm_sec);
+        snprintf(dateStr, sizeof(dateStr), "%02d/%02d/%04d",
+                 ti->tm_mon + 1, ti->tm_mday, ti->tm_year + 1900);
+        if (ti->tm_wday >= 0 && ti->tm_wday <= 6) {
+            strncpy(weekdayStr, WD[ti->tm_wday], 3);
+            weekdayStr[3] = '\0';
+        }
     } else {
-        strcpy(timeStr, "Error");
+        strcpy(timeStr, "--:--:--");
+        strcpy(dateStr, "--/--/----");
     }
     String resp;
     DynamicJsonDocument respDoc(512);
     respDoc["success"] = true;
+    respDoc["utc_epoch"] = (uint32_t)browserUtcEpoch;
     respDoc["local_time"] = timeStr;
+    respDoc["local_date"] = dateStr;
+    respDoc["weekday"] = weekdayStr;
+    respDoc["gmt_offset"] = sysConfig.gmt_offset;
+    respDoc["time_source"] = "browser";
+    respDoc["rtc_present"] = rtcPresent;
     respDoc["rtc_synced"] = rtcPresent && rtcTimeValid;
+    respDoc["drift"] = 1.0f;
     serializeJson(respDoc, resp);
     server.send(200, "application/json", resp);
 }
@@ -2832,7 +3764,9 @@ void beginWiFiConnect() {
     WiFi.disconnect(false, false);
     delay(100);
     wifiReconnectAttempts++;
-    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+    if (WiFi.getMode() != WIFI_AP_STA) {
+        WiFi.mode(WIFI_AP_STA);
+    }
     WiFi.begin(sysConfig.sta_ssid, sysConfig.sta_password);
     wifiConnecting = true;
     wifiConnectStart = millis();
@@ -2867,8 +3801,7 @@ inline bool isSingleScheduleSlotActive(uint64_t epoch,
             if (sched.days[slot] & (1 << currentWeekday)) return true;
             return false;
         } else if (cur < stop) {
-            uint64_t checkEpoch = epoch - 86400ULL;
-            uint64_t checkLocalEpoch = getLocalEpoch(checkEpoch);
+            uint64_t checkLocalEpoch = getLocalEpoch(epoch) - 86400ULL;
             struct tm* checkDate = gmtime64(&checkLocalEpoch);
             if (!checkDate) return false;
             if (!(monthMask & (1 << checkDate->tm_mon))) return false;
@@ -2957,15 +3890,10 @@ void processRelaySchedules() {
                 lastRelayOutputs[i] = shouldBeOn;
                 lastDebouncedStateGlobal[i] = shouldBeOn;
                 lastStateChangeGlobal[i] = now;
-                mqttPublishPending = true;
-                mqttPendingRelay = i;
             }
         } else if (lastRelayOutputs[i] != shouldBeOn) {
             setRelayOutput(i, shouldBeOn);
             lastRelayOutputs[i] = shouldBeOn;
-            lastStateChangeGlobal[i] = now;
-            mqttPublishPending = true;
-            mqttPendingRelay = i;
         }
     }
 }
@@ -2992,8 +3920,11 @@ void startMDNS() {
         for (char c : hostname) {
             if (isalnum(c) || c == '-') clean += c;
         }
-        if (clean.length() > 0) hostname = clean;
-        else hostname = MDNS_HOSTNAME_DEFAULT;
+        if (clean.length() > 0) {
+            hostname = clean;
+        } else {
+            hostname = MDNS_HOSTNAME_DEFAULT;
+        }
         if (hostname.length() > 31) hostname = hostname.substring(0, 31);
         strcpy(mdnsHostname, hostname.c_str());
     }
@@ -3002,14 +3933,16 @@ void startMDNS() {
         MDNS.addServiceTxt("http", "tcp", "model", "ESP32S3");
         MDNS.addServiceTxt("http", "tcp", "version", "v12");
         MDNS.addServiceTxt("http", "tcp", "channels", String(gpioConfig.count).c_str());
-        MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit,mqtt");
+        MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit,tz");
         mdnsStarted = true;
     } else {
         mdnsStarted = false;
     }
 }
 
-String getMDNSHostname() { return String(mdnsHostname); }
+String getMDNSHostname() {
+    return String(mdnsHostname);
+}
 
 // =============================================================================
 //  SETUP
@@ -3017,10 +3950,12 @@ String getMDNSHostname() { return String(mdnsHostname); }
 void setup() {
     initRTC();
     loadGPIOConfig();
-    for (int i = 0; i < MAX_RELAYS; i++) initScheduleDefaults(i);
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        initScheduleDefaults(i);
+    }
     loadConfiguration();
     loadExtConfig();
-    loadMQTTConfig();
+    loadMqttConfig();
     pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
     for (int i = 0; i < gpioConfig.count; i++) {
         int pin = getRelayPin(i);
@@ -3063,7 +3998,11 @@ void setup() {
         WiFi.mode(WIFI_AP);
     }
     uint8_t ch = extConfig.ap_channel;
-    if (ch < 1 || ch > 13) { ch = 6; extConfig.ap_channel = 6; saveExtConfig(); }
+    if (ch < 1 || ch > 13) {
+        ch = 6;
+        extConfig.ap_channel = 6;
+        saveExtConfig();
+    }
     uint8_t hidden = extConfig.ap_hidden ? 1 : 0;
     WiFi.softAPdisconnect(true);
     delay(100);
@@ -3083,6 +4022,7 @@ void setup() {
         dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
     }
     setupWebServer();
+    mqttInitialize();
     updateScheduleCache();
     lastMemoryCleanup = millis();
     lastHeapCheck = millis();
@@ -3098,12 +4038,16 @@ void loop() {
     dnsServer.processNextRequest();
     static unsigned long lastConnectionCleanup = 0;
     static unsigned long lastHealingCheck = 0;
+    static unsigned long lastDstInvalidate = 0;
     unsigned long now = millis();
+    if (timeHasElapsed(now, lastDstInvalidate, DST_CACHE_INVALIDATE_INTERVAL)) {
+        lastDstInvalidate = now;
+        invalidateDstCache();
+    }
     if (timeHasElapsed(now, lastConnectionCleanup, 60000)) {
         lastConnectionCleanup = now;
         if (!scanInProgress) {
-            int sc = WiFi.scanComplete();
-            if (sc != WIFI_SCAN_RUNNING && sc >= 0) WiFi.scanDelete();
+            WiFi.scanDelete();
         }
     }
     static unsigned long lastMemClean = 0;
@@ -3181,14 +4125,16 @@ void loop() {
         bool shouldReconnect = false;
         if (!wifiPausedForScan && extConfig.sta_enabled) {
             if (!wifiConnecting && !wifiConnected && strlen(sysConfig.sta_ssid) > 0 &&
-               (wifiGiveUpUntil == 0 || isTimeReached(now, wifiGiveUpUntil))) {
+                (wifiGiveUpUntil == 0 || isTimeReached(now, wifiGiveUpUntil))) {
                 shouldReconnect = true;
             }
             if (!wifiConnecting && WiFi.status() != WL_CONNECTED && wifiConnected) {
                 wifiConnected = false;
                 shouldReconnect = true;
             }
-            if (shouldReconnect) beginWiFiConnect();
+            if (shouldReconnect) {
+                beginWiFiConnect();
+            }
         }
         if (!wifiConnecting && WiFi.status() == WL_CONNECTED && !wifiConnected && extConfig.sta_enabled) {
             wifiConnected = true;
@@ -3202,10 +4148,16 @@ void loop() {
     }
     if (wifiConnected && extConfig.sta_enabled) {
         bool doSync = false;
-        if (lastNTPSync == 0) doSync = true;
-        else if (ntpFailCount > 0 && timeHasElapsed(now, lastNTPAttempt, NTP_RETRY_INTERVAL)) doSync = true;
-        else if (timeHasElapsed(now, lastNTPSync, getNTPInterval())) doSync = true;
-        if (doSync) tryNTPSync();
+        if (lastNTPSync == 0) {
+            doSync = true;
+        } else if (ntpFailCount > 0 && timeHasElapsed(now, lastNTPAttempt, NTP_RETRY_INTERVAL)) {
+            doSync = true;
+        } else if (timeHasElapsed(now, lastNTPSync, getNTPInterval())) {
+            doSync = true;
+        }
+        if (doSync) {
+            tryNTPSync();
+        }
     } else if (ntpAsyncStage != 0 || ntpAsyncState == NTP_STATE_CONNECTING) {
         if (ntpAsyncStage == 0 || ntpAsyncStage == 1) {
             ntpUDP.stop();
@@ -3221,7 +4173,7 @@ void loop() {
         lastScheduleProcess = now;
         processRelaySchedules();
     }
-    mqttLoop();
+    mqttService();
     yield();
 }
 
@@ -3238,24 +4190,26 @@ void initDefaults() {
     sysConfig.gmt_offset      = 28800;
     sysConfig.daylight_offset = 0;
     sysConfig.last_rtc_epoch  = 0;
-    for (int i = 0; i < MAX_RELAYS; i++) initScheduleDefaults(i);
+    strcpy(sysConfig.tz_name, "Asia/Manila");
+    sysConfig.tz_rule_id      = findTzByName("Asia/Manila");
+    if (sysConfig.tz_rule_id >= TZ_TABLE_SIZE) sysConfig.tz_rule_id = 0;
+    sysConfig.tz_auto_dst     = 1;
+    sysConfig.tz_reserved[0]  = 0;
+    sysConfig.tz_reserved[1]  = 0;
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        initScheduleDefaults(i);
+    }
     gpioConfig.count = 16;
     gpioConfig.magic = GPIO_CONFIG_MAGIC;
     memcpy(gpioConfig.pins, DEFAULT_RELAY_PINS, sizeof(uint8_t) * 16);
-    for (int i = 0; i < MAX_RELAYS; i++) gpioConfig.activeLow[i] = true;
-    memset(&extConfig, 0, sizeof(ExtConfig));
-    extConfig.magic              = EXT_CFG_MAGIC;
-    extConfig.ap_channel         = 6;
-    extConfig.ntp_sync_hours     = 1;
-    extConfig.ap_hidden          = 0;
-    extConfig.global_active_mode = 0;
-    extConfig.sta_enabled        = 1;
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        gpioConfig.activeLow[i] = true;
+    }
     timeSource = TIME_SOURCE_NONE;
     lastBrowserSync = 0;
     driftCompensation = 1.0f;
     saveConfiguration();
     saveGPIOConfig();
-    saveExtConfig();
 }
 
 void loadConfiguration() {
@@ -3264,16 +4218,21 @@ void loadConfiguration() {
     size_t relayLen = preferences.getBytes("relayConfigs", relayConfigs, sizeof(RelayConfig) * MAX_RELAYS);
     preferences.end();
     bool valid = true;
-    if (sysLen != sizeof(SystemConfig))               valid = false;
-    if (sysConfig.magic != EEPROM_MAGIC)              valid = false;
-    if (sysConfig.version != EEPROM_VERSION)          valid = false;
-    if (relayLen != sizeof(RelayConfig) * MAX_RELAYS) valid = false;
+    if (sysLen != sizeof(SystemConfig))                valid = false;
+    if (sysConfig.magic != EEPROM_MAGIC)               valid = false;
+    if (sysConfig.version != EEPROM_VERSION)           valid = false;
+    if (relayLen != sizeof(RelayConfig) * MAX_RELAYS)  valid = false;
     if (valid) {
         for (int i = 0; i < MAX_RELAYS; i++) {
-            if (relayConfigs[i].magic != RELAY_CONFIG_MAGIC) { valid = false; break; }
+            if (relayConfigs[i].magic != RELAY_CONFIG_MAGIC) {
+                valid = false;
+                break;
+            }
         }
     }
-    if (!valid) initDefaults();
+    if (!valid) {
+        initDefaults();
+    }
 }
 
 void saveConfiguration() {
@@ -3299,16 +4258,1305 @@ void loadExtConfig() {
         saveExtConfig();
         return;
     }
-    if (extConfig.ap_channel < 1 || extConfig.ap_channel > 13) extConfig.ap_channel = 6;
-    if (extConfig.ntp_sync_hours < 1 || extConfig.ntp_sync_hours > 24) extConfig.ntp_sync_hours = 1;
-    if (extConfig.global_active_mode > 2) extConfig.global_active_mode = 0;
-    if (extConfig.sta_enabled > 1) extConfig.sta_enabled = 1;
+    if (extConfig.ap_channel < 1 || extConfig.ap_channel > 13) {
+        extConfig.ap_channel = 6;
+    }
+    if (extConfig.ntp_sync_hours < 1 || extConfig.ntp_sync_hours > 24) {
+        extConfig.ntp_sync_hours = 1;
+    }
+    if (extConfig.global_active_mode > 2) {
+        extConfig.global_active_mode = 0;
+    }
+    if (extConfig.sta_enabled > 1) {
+        extConfig.sta_enabled = 1;
+    }
 }
 
 void saveExtConfig() {
     preferences.begin(NVS_NAMESPACE, false);
     preferences.putBytes("extConfig", &extConfig, sizeof(ExtConfig));
     preferences.end();
+}
+
+// =============================================================================
+//  MQTT SUPPORT
+// =============================================================================
+static void mqttSetError(const char* text) {
+    if (!text) text = "Unknown MQTT error";
+    strncpy(mqttLastError, text, sizeof(mqttLastError) - 1);
+    mqttLastError[sizeof(mqttLastError) - 1] = '\0';
+}
+
+static void mqttCopyText(char* dest, size_t destSize, const char* source) {
+    if (!dest || destSize == 0) return;
+    if (!source) source = "";
+    strncpy(dest, source, destSize - 1);
+    dest[destSize - 1] = '\0';
+}
+
+static void mqttMakeHardwareId() {
+    uint64_t mac = ESP.getEfuseMac();
+    snprintf(mqttHardwareId, sizeof(mqttHardwareId), "esp32s3_relay16_%012llX",
+             (unsigned long long)(mac & 0xFFFFFFFFFFFFULL));
+}
+
+static void mqttSetDefaults(MQTTConfig& cfg) {
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.magic = MQTT_CONFIG_MAGIC;
+    cfg.version = MQTT_CONFIG_VERSION;
+    cfg.enabled = 0;
+    cfg.port = 1883;
+    cfg.keepAliveSec = 45;
+    cfg.reconnectIntervalSec = 15;
+    cfg.telemetryIntervalSec = 60;
+    cfg.retainStates = 1;
+    cfg.commandQoS = 0;
+    cfg.willQoS = 1;
+    cfg.haDiscovery = 0;
+    char generatedId[MQTT_CLIENT_ID_LENGTH];
+    snprintf(generatedId, sizeof(generatedId), "esp32s3-relay16-%012llX",
+             (unsigned long long)(ESP.getEfuseMac() & 0xFFFFFFFFFFFFULL));
+    mqttCopyText(cfg.clientId, sizeof(cfg.clientId), generatedId);
+    char generatedTopic[MQTT_TOPIC_LENGTH];
+    snprintf(generatedTopic, sizeof(generatedTopic), "esp32s3/%s", generatedId);
+    mqttCopyText(cfg.baseTopic, sizeof(cfg.baseTopic), generatedTopic);
+    mqttCopyText(cfg.discoveryPrefix, sizeof(cfg.discoveryPrefix), "homeassistant");
+}
+
+static bool mqttReadJsonString(JsonVariantConst value, char* out, size_t outSize, bool trimWhitespace = true) {
+    if (!out || outSize == 0 || !value.is<const char*>()) return false;
+    JsonString jsonText = value.as<JsonString>();
+    const char* text = jsonText.c_str();
+    size_t textLength = jsonText.size();
+    if (!text || strlen(text) != textLength) return false;
+    size_t start = 0;
+    size_t end = textLength;
+    if (trimWhitespace) {
+        while (start < end && isspace((unsigned char)text[start])) start++;
+        while (end > start && isspace((unsigned char)text[end - 1])) end--;
+    }
+    size_t len = end - start;
+    if (len >= outSize) return false;
+    memcpy(out, text + start, len);
+    out[len] = '\0';
+    return true;
+}
+
+static void mqttStripTopicEdgeSlashes(char* topic) {
+    if (!topic) return;
+    size_t len = strlen(topic);
+    while (len > 0 && topic[len - 1] == '/') topic[--len] = '\0';
+    while (topic[0] == '/') memmove(topic, topic + 1, strlen(topic));
+}
+
+static bool mqttTopicPrefixIsValid(const char* topic, size_t maxLength) {
+    if (!topic) return false;
+    size_t len = strlen(topic);
+    if (len == 0 || len > maxLength) return false;
+    if (topic[0] == '/' || topic[len - 1] == '/') return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)topic[i];
+        if (c <= 0x20 || c == 0x7F || c == '+' || c == '#') return false;
+        if (c == '/' && i > 0 && topic[i - 1] == '/') return false;
+    }
+    return true;
+}
+
+static bool mqttHostIsValid(const char* host) {
+    if (!host || host[0] == '\0') return false;
+    size_t len = strlen(host);
+    if (len >= MQTT_HOST_LENGTH) return false;
+
+    bool numericAndDots = true;
+    bool hasDot = false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)host[i];
+        if (c == '.') hasDot = true;
+        else if (!isdigit(c)) numericAndDots = false;
+    }
+    if (numericAndDots && hasDot) {
+        uint8_t parts = 0;
+        unsigned value = 0;
+        unsigned digits = 0;
+        for (size_t i = 0; i <= len; i++) {
+            if (i == len || host[i] == '.') {
+                if (digits == 0 || digits > 3 || value > 255 || parts >= 4) return false;
+                parts++;
+                value = 0;
+                digits = 0;
+            } else {
+                if (!isdigit((unsigned char)host[i])) return false;
+                value = value * 10U + (unsigned)(host[i] - '0');
+                digits++;
+                if (digits > 3 || value > 255) return false;
+            }
+        }
+        return parts == 4;
+    }
+
+    size_t labelStart = 0;
+    size_t labelLength = 0;
+    for (size_t i = 0; i <= len; i++) {
+        if (i == len || host[i] == '.') {
+            if (labelLength == 0) {
+                return i == len && labelStart > 0 && host[len - 1] == '.';
+            }
+            if (labelLength > 63 || host[labelStart] == '-' || host[i - 1] == '-') return false;
+            labelStart = i + 1;
+            labelLength = 0;
+        } else {
+            unsigned char c = (unsigned char)host[i];
+            if (!(isalnum(c) || c == '-')) return false;
+            labelLength++;
+            if (labelLength > 63) return false;
+        }
+    }
+    return true;
+}
+
+static bool mqttClientIdIsValid(const char* id) {
+    if (!id) return false;
+    size_t len = strlen(id);
+    if (len == 0 || len >= MQTT_CLIENT_ID_LENGTH) return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)id[i];
+        if (!(isalnum(c) || c == '-' || c == '_' || c == '.')) return false;
+    }
+    return true;
+}
+
+static void mqttSetValidationError(char* error, size_t errorSize, const char* text) {
+    if (error && errorSize) mqttCopyText(error, errorSize, text);
+}
+
+static bool mqttValidateConfig(const MQTTConfig& cfg, bool requireBroker, char* error, size_t errorSize) {
+    if (cfg.enabled > 1 || cfg.retainStates > 1 || cfg.haDiscovery > 1) {
+        mqttSetValidationError(error, errorSize, "Invalid boolean setting in MQTT configuration");
+        return false;
+    }
+    if (cfg.port == 0) {
+        mqttSetValidationError(error, errorSize, "Broker port must be 1-65535");
+        return false;
+    }
+    if (cfg.keepAliveSec < 15 || cfg.keepAliveSec > 300) {
+        mqttSetValidationError(error, errorSize, "Keep-alive must be 15-300 seconds");
+        return false;
+    }
+    if (cfg.reconnectIntervalSec < MQTT_RECONNECT_MIN_SECONDS || cfg.reconnectIntervalSec > MQTT_RECONNECT_MAX_SECONDS) {
+        mqttSetValidationError(error, errorSize, "Reconnect interval must be 2-300 seconds");
+        return false;
+    }
+    if (cfg.telemetryIntervalSec > 3600) {
+        mqttSetValidationError(error, errorSize, "Telemetry interval must be 0-3600 seconds");
+        return false;
+    }
+    if (cfg.commandQoS > 1 || cfg.willQoS > 1) {
+        mqttSetValidationError(error, errorSize, "QoS must be 0 or 1");
+        return false;
+    }
+    if ((requireBroker || cfg.enabled) && !mqttHostIsValid(cfg.brokerHost)) {
+        mqttSetValidationError(error, errorSize, "Enter a valid broker hostname or IPv4 address");
+        return false;
+    }
+    if (cfg.brokerHost[0] && !mqttHostIsValid(cfg.brokerHost)) {
+        mqttSetValidationError(error, errorSize, "Broker host contains unsupported characters");
+        return false;
+    }
+    if (!mqttClientIdIsValid(cfg.clientId)) {
+        mqttSetValidationError(error, errorSize, "Client ID must be 1-48 letters, digits, dot, underscore, or hyphen");
+        return false;
+    }
+    if (!mqttTopicPrefixIsValid(cfg.baseTopic, MQTT_TOPIC_LENGTH - 1)) {
+        mqttSetValidationError(error, errorSize, "Base topic is empty or contains an invalid MQTT topic character");
+        return false;
+    }
+    if (!mqttTopicPrefixIsValid(cfg.discoveryPrefix, MQTT_DISCOVERY_PREFIX_LENGTH - 1)) {
+        mqttSetValidationError(error, errorSize, "Discovery prefix is empty or contains an invalid MQTT topic character");
+        return false;
+    }
+    if (cfg.username[0] == '\0' && cfg.password[0] != '\0') {
+        mqttSetValidationError(error, errorSize, "Clear the password or provide a username");
+        return false;
+    }
+    return true;
+}
+
+static bool mqttParseConfigJson(DynamicJsonDocument& doc, MQTTConfig& cfg, bool requireBroker,
+                               char* error, size_t errorSize) {
+    if (!doc.is<JsonObject>()) {
+        mqttSetValidationError(error, errorSize, "JSON body must be an object");
+        return false;
+    }
+    if (doc.containsKey("enabled")) {
+        if (!doc["enabled"].is<bool>()) { mqttSetValidationError(error, errorSize, "enabled must be true or false"); return false; }
+        cfg.enabled = doc["enabled"].as<bool>() ? 1 : 0;
+    }
+    if (doc.containsKey("brokerHost")) {
+        if (!mqttReadJsonString(doc["brokerHost"], cfg.brokerHost, sizeof(cfg.brokerHost))) {
+            mqttSetValidationError(error, errorSize, "brokerHost is too long or is not text"); return false;
+        }
+    }
+    if (doc.containsKey("clientId")) {
+        if (!mqttReadJsonString(doc["clientId"], cfg.clientId, sizeof(cfg.clientId))) {
+            mqttSetValidationError(error, errorSize, "clientId is too long or is not text"); return false;
+        }
+    }
+    if (doc.containsKey("username")) {
+        char inputUsername[MQTT_USER_LENGTH];
+        if (!mqttReadJsonString(doc["username"], inputUsername, sizeof(inputUsername), false)) {
+            mqttSetValidationError(error, errorSize, "username is too long or is not text"); return false;
+        }
+        memset(cfg.username, 0, sizeof(cfg.username));
+        mqttCopyText(cfg.username, sizeof(cfg.username), inputUsername);
+    }
+    if (doc.containsKey("password")) {
+        char inputPassword[MQTT_PASSWORD_LENGTH];
+        if (!mqttReadJsonString(doc["password"], inputPassword, sizeof(inputPassword), false)) {
+            mqttSetValidationError(error, errorSize, "password is too long or is not text"); return false;
+        }
+        if (inputPassword[0]) {
+            memset(cfg.password, 0, sizeof(cfg.password));
+            mqttCopyText(cfg.password, sizeof(cfg.password), inputPassword);
+        }
+    }
+    if (doc.containsKey("clearPassword")) {
+        if (!doc["clearPassword"].is<bool>()) { mqttSetValidationError(error, errorSize, "clearPassword must be true or false"); return false; }
+        if (doc["clearPassword"].as<bool>()) memset(cfg.password, 0, sizeof(cfg.password));
+    }
+    if (doc.containsKey("baseTopic")) {
+        if (!mqttReadJsonString(doc["baseTopic"], cfg.baseTopic, sizeof(cfg.baseTopic))) {
+            mqttSetValidationError(error, errorSize, "baseTopic is too long or is not text"); return false;
+        }
+        mqttStripTopicEdgeSlashes(cfg.baseTopic);
+    }
+    if (doc.containsKey("discoveryPrefix")) {
+        if (!mqttReadJsonString(doc["discoveryPrefix"], cfg.discoveryPrefix, sizeof(cfg.discoveryPrefix))) {
+            mqttSetValidationError(error, errorSize, "discoveryPrefix is too long or is not text"); return false;
+        }
+        mqttStripTopicEdgeSlashes(cfg.discoveryPrefix);
+    }
+    if (doc.containsKey("port")) {
+        if (!doc["port"].is<int>()) { mqttSetValidationError(error, errorSize, "port must be a number from 1 to 65535"); return false; }
+        long value = doc["port"].as<long>();
+        if (value < 1 || value > 65535) { mqttSetValidationError(error, errorSize, "port must be 1-65535"); return false; }
+        cfg.port = (uint16_t)value;
+    }
+    if (doc.containsKey("keepAliveSec")) {
+        if (!doc["keepAliveSec"].is<int>()) { mqttSetValidationError(error, errorSize, "keepAliveSec must be numeric"); return false; }
+        long value = doc["keepAliveSec"].as<long>();
+        if (value < 15 || value > 300) { mqttSetValidationError(error, errorSize, "keepAliveSec must be 15-300"); return false; }
+        cfg.keepAliveSec = (uint16_t)value;
+    }
+    if (doc.containsKey("reconnectIntervalSec")) {
+        if (!doc["reconnectIntervalSec"].is<int>()) { mqttSetValidationError(error, errorSize, "reconnectIntervalSec must be numeric"); return false; }
+        long value = doc["reconnectIntervalSec"].as<long>();
+        if (value < MQTT_RECONNECT_MIN_SECONDS || value > MQTT_RECONNECT_MAX_SECONDS) { mqttSetValidationError(error, errorSize, "reconnectIntervalSec must be 2-300"); return false; }
+        cfg.reconnectIntervalSec = (uint16_t)value;
+    }
+    if (doc.containsKey("telemetryIntervalSec")) {
+        if (!doc["telemetryIntervalSec"].is<int>()) { mqttSetValidationError(error, errorSize, "telemetryIntervalSec must be numeric"); return false; }
+        long value = doc["telemetryIntervalSec"].as<long>();
+        if (value < 0 || value > 3600) { mqttSetValidationError(error, errorSize, "telemetryIntervalSec must be 0-3600"); return false; }
+        cfg.telemetryIntervalSec = (uint16_t)value;
+    }
+    if (doc.containsKey("commandQoS")) {
+        if (!doc["commandQoS"].is<int>()) { mqttSetValidationError(error, errorSize, "commandQoS must be 0 or 1"); return false; }
+        int value = doc["commandQoS"].as<int>();
+        if (value < 0 || value > 1) { mqttSetValidationError(error, errorSize, "commandQoS must be 0 or 1"); return false; }
+        cfg.commandQoS = (uint8_t)value;
+    }
+    if (doc.containsKey("willQoS")) {
+        if (!doc["willQoS"].is<int>()) { mqttSetValidationError(error, errorSize, "willQoS must be 0 or 1"); return false; }
+        int value = doc["willQoS"].as<int>();
+        if (value < 0 || value > 1) { mqttSetValidationError(error, errorSize, "willQoS must be 0 or 1"); return false; }
+        cfg.willQoS = (uint8_t)value;
+    }
+    if (doc.containsKey("retainStates")) {
+        if (!doc["retainStates"].is<bool>()) { mqttSetValidationError(error, errorSize, "retainStates must be true or false"); return false; }
+        cfg.retainStates = doc["retainStates"].as<bool>() ? 1 : 0;
+    }
+    if (doc.containsKey("haDiscovery")) {
+        if (!doc["haDiscovery"].is<bool>()) { mqttSetValidationError(error, errorSize, "haDiscovery must be true or false"); return false; }
+        cfg.haDiscovery = doc["haDiscovery"].as<bool>() ? 1 : 0;
+    }
+    return mqttValidateConfig(cfg, requireBroker, error, errorSize);
+}
+
+void loadMqttConfig() {
+    MQTTConfig loaded;
+    memset(&loaded, 0, sizeof(loaded));
+    preferences.begin(NVS_NAMESPACE, true);
+    size_t len = preferences.getBytes("mqttConfig", &loaded, sizeof(loaded));
+    preferences.end();
+    bool valid = len == sizeof(loaded) && loaded.magic == MQTT_CONFIG_MAGIC &&
+                 loaded.version == MQTT_CONFIG_VERSION;
+    if (valid) {
+        loaded.brokerHost[sizeof(loaded.brokerHost) - 1] = '\0';
+        loaded.clientId[sizeof(loaded.clientId) - 1] = '\0';
+        loaded.username[sizeof(loaded.username) - 1] = '\0';
+        loaded.password[sizeof(loaded.password) - 1] = '\0';
+        loaded.baseTopic[sizeof(loaded.baseTopic) - 1] = '\0';
+        loaded.discoveryPrefix[sizeof(loaded.discoveryPrefix) - 1] = '\0';
+        mqttConfig = loaded;
+        char validationError[96];
+        valid = mqttValidateConfig(mqttConfig, false, validationError, sizeof(validationError));
+    }
+    if (!valid) {
+        mqttSetDefaults(mqttConfig);
+        preferences.begin(NVS_NAMESPACE, false);
+        preferences.putBytes("mqttConfig", &mqttConfig, sizeof(mqttConfig));
+        preferences.end();
+    }
+    mqttMakeHardwareId();
+    mqttSetError(mqttConfig.enabled ? "Waiting for Wi-Fi" : "MQTT is disabled");
+}
+
+static bool mqttSaveConfigRecord(const MQTTConfig& cfg) {
+    preferences.begin(NVS_NAMESPACE, false);
+    size_t written = preferences.putBytes("mqttConfig", &cfg, sizeof(cfg));
+    preferences.end();
+    return written == sizeof(cfg);
+}
+
+static bool mqttConfigsEqual(const MQTTConfig& a, const MQTTConfig& b) {
+    return a.enabled == b.enabled && a.port == b.port && a.keepAliveSec == b.keepAliveSec &&
+           a.reconnectIntervalSec == b.reconnectIntervalSec && a.telemetryIntervalSec == b.telemetryIntervalSec &&
+           a.retainStates == b.retainStates && a.commandQoS == b.commandQoS && a.willQoS == b.willQoS &&
+           a.haDiscovery == b.haDiscovery && strcmp(a.brokerHost, b.brokerHost) == 0 &&
+           strcmp(a.clientId, b.clientId) == 0 && strcmp(a.username, b.username) == 0 &&
+           strcmp(a.password, b.password) == 0 && strcmp(a.baseTopic, b.baseTopic) == 0 &&
+           strcmp(a.discoveryPrefix, b.discoveryPrefix) == 0;
+}
+
+static bool mqttMakeTopic(char* out, size_t outSize, const char* base, const char* suffix) {
+    if (!out || outSize == 0 || !base || !suffix) return false;
+    int written = snprintf(out, outSize, "%s/%s", base, suffix);
+    return written > 0 && (size_t)written < outSize;
+}
+
+static bool mqttPublishRaw(const char* topic, const char* payload, bool retained) {
+    if (!mqttClient.connected() || !topic || !payload) return false;
+    if (mqttClient.publish(topic, payload, retained)) {
+        mqttPublishedCount++;
+        return true;
+    }
+    mqttSetError("Publish failed (connection, ACL, or packet buffer)");
+    return false;
+}
+
+static bool mqttPublishOnBase(const char* base, const char* suffix, const char* payload, bool retained) {
+    char topic[MQTT_TOPIC_LENGTH + 96];
+    if (!mqttMakeTopic(topic, sizeof(topic), base, suffix)) {
+        mqttSetError("MQTT topic is too long");
+        return false;
+    }
+    return mqttPublishRaw(topic, payload, retained);
+}
+
+static bool mqttClearRetainedRelay(const char* base, uint8_t relayNumber) {
+    char suffix[48];
+    snprintf(suffix, sizeof(suffix), "relay/%u/state", relayNumber);
+    bool ok = mqttPublishOnBase(base, suffix, "", true);
+    snprintf(suffix, sizeof(suffix), "relay/%u/mode", relayNumber);
+    ok = mqttPublishOnBase(base, suffix, "", true) && ok;
+    snprintf(suffix, sizeof(suffix), "relay/%u/attributes", relayNumber);
+    ok = mqttPublishOnBase(base, suffix, "", true) && ok;
+    return ok;
+}
+
+static void mqttMarkStateDirty() {
+    mqttStateDirty = true;
+}
+
+void mqttMarkDiscoveryDirty() {
+    mqttDiscoveryDirty = true;
+    mqttRetainedLayoutCleanupPending = true;
+    mqttTelemetryPending = true;
+    mqttNextTelemetryAt = 0;
+}
+
+static void mqttSetRelayState(uint8_t relay, bool state) {
+    relayConfigs[relay].manualOverride = true;
+    relayConfigs[relay].manualState = state;
+    scheduleActiveCache[relay] = false;
+    setRelayOutput(relay, state);
+    lastRelayOutputs[relay] = state;
+    lastDebouncedStateGlobal[relay] = state;
+    lastStateChangeGlobal[relay] = millis();
+}
+
+static void mqttSetRelayAuto(uint8_t relay) {
+    relayConfigs[relay].manualOverride = false;
+    updateScheduleCache();
+}
+
+static const char* mqttStateText(int state) {
+    switch (state) {
+        case 0: return "Connected";
+        case -4: return "Connection timeout";
+        case -3: return "Connection lost";
+        case -2: return "TCP connect failed";
+        case -1: return "Disconnected";
+        case 1: return "Broker rejected MQTT protocol version";
+        case 2: return "Broker rejected client ID";
+        case 3: return "Broker unavailable";
+        case 4: return "Bad username or password";
+        case 5: return "Not authorized by broker";
+        default: return "Unknown broker/client error";
+    }
+}
+
+static void mqttQueueCommandResponse(bool ok, const char* command, int relayNumber,
+                                     bool allRelays, const char* errorText) {
+    StaticJsonDocument<256> doc;
+    doc["success"] = ok;
+    if (allRelays) doc["relay"] = "all";
+    else if (relayNumber > 0) doc["relay"] = relayNumber;
+    if (command) doc["command"] = command;
+    if (errorText && errorText[0]) doc["error"] = errorText;
+    size_t n = serializeJson(doc, mqttPendingCommandResponse, sizeof(mqttPendingCommandResponse));
+    mqttCommandResponsePending = n > 0 && n < sizeof(mqttPendingCommandResponse);
+    mqttNextCommandResponseAt = 0;
+}
+
+static bool mqttJsonCommandValue(JsonVariant value, char* out, size_t outSize) {
+    if (!out || outSize == 0 || value.isNull()) return false;
+    if (value.is<const char*>()) {
+        JsonString jsonText = value.as<JsonString>();
+        const char* text = jsonText.c_str();
+        size_t textLength = jsonText.size();
+        if (!text || strlen(text) != textLength || textLength >= outSize) return false;
+        memcpy(out, text, textLength);
+        out[textLength] = '\0';
+        return true;
+    }
+    if (value.is<bool>()) {
+        mqttCopyText(out, outSize, value.as<bool>() ? "ON" : "OFF");
+        return true;
+    }
+    if (value.is<int>()) {
+        int number = value.as<int>();
+        if (number != 0 && number != 1) return false;
+        mqttCopyText(out, outSize, number ? "ON" : "OFF");
+        return true;
+    }
+    return false;
+}
+
+static bool mqttExtractCommand(const byte* payload, unsigned int length, char* out, size_t outSize) {
+    if (!payload || !out || outSize == 0 || length == 0 || length > MQTT_COMMAND_MAX_LENGTH) return false;
+    for (unsigned int i = 0; i < length; i++) if (payload[i] == 0) return false;
+    char raw[MQTT_COMMAND_MAX_LENGTH + 1];
+    memcpy(raw, payload, length);
+    raw[length] = '\0';
+    size_t start = 0;
+    size_t end = length;
+    while (start < end && isspace((unsigned char)raw[start])) start++;
+    while (end > start && isspace((unsigned char)raw[end - 1])) end--;
+    if (start == end) return false;
+    raw[end] = '\0';
+    const char* selected = raw + start;
+    char valueBuffer[64];
+    if (selected[0] == '{' || selected[0] == '"') {
+        StaticJsonDocument<256> doc;
+        DeserializationError err = deserializeJson(doc, selected);
+        if (err) return false;
+        if (doc.is<const char*>()) {
+            JsonString jsonText = doc.as<JsonString>();
+            const char* text = jsonText.c_str();
+            size_t textLength = jsonText.size();
+            if (!text || strlen(text) != textLength || textLength >= sizeof(valueBuffer)) return false;
+            memcpy(valueBuffer, text, textLength);
+            valueBuffer[textLength] = '\0';
+        } else if (doc.is<JsonObject>()) {
+            JsonObject obj = doc.as<JsonObject>();
+            bool found = mqttJsonCommandValue(obj["command"], valueBuffer, sizeof(valueBuffer));
+            if (!found) found = mqttJsonCommandValue(obj["state"], valueBuffer, sizeof(valueBuffer));
+            if (!found) found = mqttJsonCommandValue(obj["mode"], valueBuffer, sizeof(valueBuffer));
+            if (!found) return false;
+        } else {
+            return false;
+        }
+        selected = valueBuffer;
+    }
+    size_t valueStart = 0;
+    size_t valueEnd = strlen(selected);
+    while (valueStart < valueEnd && isspace((unsigned char)selected[valueStart])) valueStart++;
+    while (valueEnd > valueStart && isspace((unsigned char)selected[valueEnd - 1])) valueEnd--;
+    size_t len = valueEnd - valueStart;
+    selected += valueStart;
+    if (len == 0 || len >= outSize) return false;
+    memcpy(out, selected, len);
+    out[len] = '\0';
+    for (size_t i = 0; i < len; i++) out[i] = (char)toupper((unsigned char)out[i]);
+    return true;
+}
+
+static bool mqttParseCommandTopic(const char* topic, int& relayIndex, bool& allRelays) {
+    relayIndex = -1;
+    allRelays = false;
+    if (!topic) return false;
+    char prefix[MQTT_TOPIC_LENGTH + 16];
+    int n = snprintf(prefix, sizeof(prefix), "%s/relay/", mqttConfig.baseTopic);
+    if (n <= 0 || (size_t)n >= sizeof(prefix) || strncmp(topic, prefix, (size_t)n) != 0) return false;
+    size_t topicLen = strlen(topic);
+    static const char suffix[] = "/command";
+    const size_t suffixLen = sizeof(suffix) - 1;
+    if (topicLen <= (size_t)n + suffixLen || strcmp(topic + topicLen - suffixLen, suffix) != 0) return false;
+    size_t levelLen = topicLen - (size_t)n - suffixLen;
+    if (levelLen == 0 || levelLen >= 16) return false;
+    char level[16];
+    memcpy(level, topic + n, levelLen);
+    level[levelLen] = '\0';
+    if (strcmp(level, "all") == 0) {
+        allRelays = true;
+        return true;
+    }
+    for (size_t i = 0; i < levelLen; i++) if (!isdigit((unsigned char)level[i])) return false;
+    char* endPtr = NULL;
+    long oneBased = strtol(level, &endPtr, 10);
+    if (!endPtr || *endPtr || oneBased < 1 || oneBased > MAX_RELAYS) return false;
+    relayIndex = (int)oneBased - 1;
+    return true;
+}
+
+static void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    mqttReceivedCount++;
+    int relayIndex = -1;
+    bool allRelays = false;
+    if (!mqttParseCommandTopic(topic, relayIndex, allRelays)) {
+        mqttQueueCommandResponse(false, NULL, 0, false, "Unrecognized command topic");
+        return;
+    }
+    if (!allRelays && relayIndex >= gpioConfig.count) {
+        mqttQueueCommandResponse(false, NULL, relayIndex + 1, false, "Relay is not configured");
+        return;
+    }
+    char command[64];
+    if (!mqttExtractCommand(payload, length, command, sizeof(command))) {
+        mqttQueueCommandResponse(false, NULL, allRelays ? 0 : relayIndex + 1, allRelays, "Invalid or oversized payload");
+        return;
+    }
+    bool isOn = strcmp(command, "ON") == 0 || strcmp(command, "TRUE") == 0 || strcmp(command, "1") == 0;
+    bool isOff = strcmp(command, "OFF") == 0 || strcmp(command, "FALSE") == 0 || strcmp(command, "0") == 0;
+    bool isToggle = strcmp(command, "TOGGLE") == 0;
+    bool isAuto = strcmp(command, "AUTO") == 0 || strcmp(command, "SCHEDULE") == 0;
+    bool isStatus = strcmp(command, "STATUS") == 0 || strcmp(command, "QUERY") == 0;
+    if (!isOn && !isOff && !isToggle && !isAuto && !isStatus) {
+        mqttQueueCommandResponse(false, command, allRelays ? 0 : relayIndex + 1, allRelays,
+                                 "Use ON, OFF, TOGGLE, AUTO, or STATUS");
+        return;
+    }
+    if (isToggle && mqttConfig.commandQoS == 1) {
+        mqttQueueCommandResponse(false, command, allRelays ? 0 : relayIndex + 1, allRelays,
+                                 "TOGGLE is disabled at QoS 1 because duplicate delivery could toggle twice; use ON or OFF");
+        return;
+    }
+    if (isStatus) {
+        mqttMarkStateDirty();
+        mqttQueueCommandResponse(true, command, allRelays ? 0 : relayIndex + 1, allRelays, NULL);
+        return;
+    }
+    uint8_t first = allRelays ? 0 : (uint8_t)relayIndex;
+    uint8_t end = allRelays ? gpioConfig.count : (uint8_t)(relayIndex + 1);
+    if (allRelays && end == 0) {
+        mqttQueueCommandResponse(false, command, 0, true, "No relays are configured");
+        return;
+    }
+    for (uint8_t i = first; i < end; i++) {
+        if (isAuto) mqttSetRelayAuto(i);
+        else {
+            bool target = isOn ? true : (isOff ? false : !lastRelayOutputs[i]);
+            mqttSetRelayState(i, target);
+        }
+    }
+    saveConfiguration();
+    mqttMarkStateDirty();
+    mqttQueueCommandResponse(true, command, allRelays ? 0 : relayIndex + 1, allRelays, NULL);
+}
+
+static bool mqttPublishRelay(uint8_t index) {
+    if (index >= gpioConfig.count) return true;
+    char suffix[48];
+    snprintf(suffix, sizeof(suffix), "relay/%u/state", (unsigned)(index + 1));
+    const char* state = lastRelayOutputs[index] ? "ON" : "OFF";
+    bool ok = mqttPublishOnBase(mqttConfig.baseTopic, suffix, state, mqttConfig.retainStates != 0);
+    snprintf(suffix, sizeof(suffix), "relay/%u/mode", (unsigned)(index + 1));
+    const char* mode = relayConfigs[index].manualOverride ? "MANUAL" : "AUTO";
+    ok = mqttPublishOnBase(mqttConfig.baseTopic, suffix, mode, mqttConfig.retainStates != 0) && ok;
+    StaticJsonDocument<256> attrs;
+    attrs["name"] = relayConfigs[index].name;
+    attrs["pin"] = getRelayPin(index);
+    attrs["activeLow"] = isActiveLow(index);
+    attrs["manual"] = relayConfigs[index].manualOverride;
+    attrs["mode"] = mode;
+    attrs["state"] = state;
+    char payload[384];
+    size_t n = serializeJson(attrs, payload, sizeof(payload));
+    if (n >= sizeof(payload)) return false;
+    snprintf(suffix, sizeof(suffix), "relay/%u/attributes", (unsigned)(index + 1));
+    ok = mqttPublishOnBase(mqttConfig.baseTopic, suffix, payload, mqttConfig.retainStates != 0) && ok;
+    return ok;
+}
+
+static bool mqttPublishStateSnapshot() {
+    bool ok = true;
+    for (uint8_t i = 0; i < gpioConfig.count; i++) ok = mqttPublishRelay(i) && ok;
+    DynamicJsonDocument doc(4096);
+    doc["device"] = mqttHardwareId;
+    doc["relayCount"] = gpioConfig.count;
+    JsonArray relays = doc.createNestedArray("relays");
+    for (uint8_t i = 0; i < gpioConfig.count; i++) {
+        JsonObject relay = relays.createNestedObject();
+        relay["id"] = i + 1;
+        relay["name"] = relayConfigs[i].name;
+        relay["state"] = lastRelayOutputs[i] ? "ON" : "OFF";
+        relay["mode"] = relayConfigs[i].manualOverride ? "MANUAL" : "AUTO";
+        relay["pin"] = getRelayPin(i);
+        relay["activeLow"] = isActiveLow(i);
+    }
+    String payload;
+    payload.reserve(1800);
+    serializeJson(doc, payload);
+    if (payload.length() + strlen(mqttConfig.baseTopic) + 16 >= MQTT_PACKET_BUFFER_SIZE) {
+        mqttSetError("Aggregate state exceeds MQTT packet buffer");
+        return false;
+    }
+    ok = mqttPublishOnBase(mqttConfig.baseTopic, "state", payload.c_str(), mqttConfig.retainStates != 0) && ok;
+    return ok;
+}
+
+static bool mqttPublishTelemetry() {
+    DynamicJsonDocument doc(768);
+    bool wifiReady = extConfig.sta_enabled && WiFi.status() == WL_CONNECTED;
+    doc["device"] = mqttHardwareId;
+    doc["uptimeSec"] = (uint64_t)(esp_timer_get_time() / 1000000ULL);
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["wifiConnected"] = wifiReady;
+    if (wifiReady) {
+        doc["ip"] = WiFi.localIP().toString();
+        doc["rssi"] = WiFi.RSSI();
+    }
+    doc["relayCount"] = gpioConfig.count;
+    doc["timeSource"] = timeSource == TIME_SOURCE_NTP ? "NTP" :
+                         timeSource == TIME_SOURCE_BROWSER ? "Browser" :
+                         timeSource == TIME_SOURCE_RTC ? "RTC" : "None";
+    doc["timezone"] = sysConfig.tz_name;
+    doc["automaticDst"] = sysConfig.tz_auto_dst != 0;
+    doc["rtcPresent"] = rtcPresent;
+    uint64_t epoch = getCurrentEpoch();
+    int32_t dstOffset = (epoch >= MIN_UNIX_TIME_64) ? currentDstOffset(epoch) : 0;
+    doc["dstOffsetSeconds"] = dstOffset;
+    if (epoch >= MIN_UNIX_TIME_64) {
+        uint64_t localEpoch = getLocalEpoch(epoch);
+        char localEpochText[24];
+        snprintf(localEpochText, sizeof(localEpochText), "%llu", (unsigned long long)localEpoch);
+        doc["localEpoch"] = localEpochText;
+    }
+    if (epoch >= MIN_UNIX_TIME_64) {
+        char epochText[24];
+        snprintf(epochText, sizeof(epochText), "%llu", (unsigned long long)epoch);
+        doc["utcEpoch"] = epochText;
+    }
+    String payload;
+    payload.reserve(600);
+    serializeJson(doc, payload);
+    return mqttPublishOnBase(mqttConfig.baseTopic, "system/state", payload.c_str(), mqttConfig.retainStates != 0);
+}
+
+static void mqttPersistPublishedStateLayout() {
+    preferences.begin(NVS_NAMESPACE, false);
+    preferences.putString("mPubHost", mqttConfig.brokerHost);
+    preferences.putUShort("mPubPort", mqttConfig.port);
+    preferences.putString("mPubBase", mqttConfig.baseTopic);
+    preferences.putUChar("mPubCount", gpioConfig.count);
+    preferences.putBool("mPubRetain", mqttConfig.retainStates != 0);
+    preferences.end();
+    mqttRetainedLayoutCleanupPending = false;
+}
+
+static bool mqttCleanupOldRetainedLayout() {
+    preferences.begin(NVS_NAMESPACE, true);
+    String oldHost = preferences.getString("mPubHost", "");
+    uint16_t oldPort = preferences.getUShort("mPubPort", 0);
+    String oldBase = preferences.getString("mPubBase", "");
+    uint8_t oldCount = preferences.getUChar("mPubCount", 0);
+    bool oldRetain = preferences.getBool("mPubRetain", false);
+    preferences.end();
+    if (oldHost.length() == 0 || oldBase.length() == 0 || oldCount > MAX_RELAYS ||
+        oldHost != String(mqttConfig.brokerHost) || oldPort != mqttConfig.port) return true;
+    bool clearAll = oldBase != String(mqttConfig.baseTopic) || (oldRetain && !mqttConfig.retainStates);
+    bool ok = true;
+    if (clearAll) {
+        for (uint8_t i = 1; i <= oldCount; i++) ok = mqttClearRetainedRelay(oldBase.c_str(), i) && ok;
+        ok = mqttPublishOnBase(oldBase.c_str(), "state", "", true) && ok;
+        ok = mqttPublishOnBase(oldBase.c_str(), "system/state", "", true) && ok;
+        if (oldBase != String(mqttConfig.baseTopic)) {
+            ok = mqttPublishOnBase(oldBase.c_str(), "availability", "offline", true) && ok;
+            ok = mqttPublishOnBase(oldBase.c_str(), "command/response", "", true) && ok;
+        }
+    } else if (oldCount > gpioConfig.count) {
+        for (uint8_t i = gpioConfig.count + 1; i <= oldCount; i++) ok = mqttClearRetainedRelay(oldBase.c_str(), i) && ok;
+    }
+    return ok;
+}
+
+static bool mqttPublishDiscoveryRelay(uint8_t index) {
+    if (index >= gpioConfig.count) return true;
+    char stateTopic[MQTT_TOPIC_LENGTH + 48];
+    char commandTopic[MQTT_TOPIC_LENGTH + 48];
+    char attributesTopic[MQTT_TOPIC_LENGTH + 48];
+    char availabilityTopic[MQTT_TOPIC_LENGTH + 32];
+    if (!mqttMakeTopic(stateTopic, sizeof(stateTopic), mqttConfig.baseTopic, "relay/1/state")) return false;
+    if (!mqttMakeTopic(commandTopic, sizeof(commandTopic), mqttConfig.baseTopic, "relay/1/command")) return false;
+    if (!mqttMakeTopic(attributesTopic, sizeof(attributesTopic), mqttConfig.baseTopic, "relay/1/attributes")) return false;
+    if (!mqttMakeTopic(availabilityTopic, sizeof(availabilityTopic), mqttConfig.baseTopic, "availability")) return false;
+    snprintf(stateTopic, sizeof(stateTopic), "%s/relay/%u/state", mqttConfig.baseTopic, (unsigned)(index + 1));
+    snprintf(commandTopic, sizeof(commandTopic), "%s/relay/%u/command", mqttConfig.baseTopic, (unsigned)(index + 1));
+    snprintf(attributesTopic, sizeof(attributesTopic), "%s/relay/%u/attributes", mqttConfig.baseTopic, (unsigned)(index + 1));
+    char discoveryTopic[MQTT_DISCOVERY_PREFIX_LENGTH + 96];
+    int topicLen = snprintf(discoveryTopic, sizeof(discoveryTopic), "%s/switch/%s/relay_%u/config",
+                            mqttConfig.discoveryPrefix, mqttHardwareId, (unsigned)(index + 1));
+    if (topicLen <= 0 || (size_t)topicLen >= sizeof(discoveryTopic)) return false;
+    StaticJsonDocument<1536> doc;
+    char fallbackName[20];
+    snprintf(fallbackName, sizeof(fallbackName), "Relay %u", (unsigned)(index + 1));
+    doc["name"] = relayConfigs[index].name[0] ? relayConfigs[index].name : fallbackName;
+    char uniqueId[64];
+    snprintf(uniqueId, sizeof(uniqueId), "%s_relay_%u", mqttHardwareId, (unsigned)(index + 1));
+    doc["unique_id"] = uniqueId;
+    doc["state_topic"] = stateTopic;
+    doc["command_topic"] = commandTopic;
+    doc["json_attributes_topic"] = attributesTopic;
+    doc["availability_topic"] = availabilityTopic;
+    doc["payload_on"] = "ON";
+    doc["payload_off"] = "OFF";
+    doc["payload_available"] = "online";
+    doc["payload_not_available"] = "offline";
+    doc["qos"] = mqttConfig.commandQoS;
+    doc["retain"] = false;
+    JsonObject device = doc.createNestedObject("device");
+    JsonArray identifiers = device.createNestedArray("identifiers");
+    identifiers.add(mqttHardwareId);
+    device["name"] = "ESP32S3 Relay Timer";
+    device["manufacturer"] = "Generic ESP32S3";
+    device["model"] = "16-Channel Automatic Relay Timer Switch";
+    char json[1536];
+    size_t jsonLen = serializeJson(doc, json, sizeof(json));
+    if (jsonLen >= sizeof(json)) return false;
+    return mqttPublishRaw(discoveryTopic, json, true);
+}
+
+static bool mqttPublishDiscovery() {
+    preferences.begin(NVS_NAMESPACE, true);
+    String oldPrefix = preferences.getString("mHaPrefix", "");
+    String oldBase = preferences.getString("mHaBase", "");
+    uint8_t oldCount = preferences.getUChar("mHaCount", 0);
+    bool oldEnabled = preferences.getBool("mHaEnabled", false);
+    preferences.end();
+    bool currentEnabled = mqttConfig.haDiscovery != 0;
+    bool oldIdentityChanged = oldEnabled && (oldPrefix != String(mqttConfig.discoveryPrefix) || oldBase != String(mqttConfig.baseTopic));
+    bool ok = true;
+    if (oldEnabled && (oldIdentityChanged || !currentEnabled)) {
+        for (uint8_t i = 1; i <= oldCount && i <= MAX_RELAYS; i++) {
+            char topic[MQTT_DISCOVERY_PREFIX_LENGTH + 96];
+            snprintf(topic, sizeof(topic), "%s/switch/%s/relay_%u/config", oldPrefix.c_str(), mqttHardwareId, (unsigned)i);
+            ok = mqttPublishRaw(topic, "", true) && ok;
+        }
+    } else if (oldEnabled && oldCount > gpioConfig.count) {
+        for (uint8_t i = gpioConfig.count + 1; i <= oldCount && i <= MAX_RELAYS; i++) {
+            char topic[MQTT_DISCOVERY_PREFIX_LENGTH + 96];
+            snprintf(topic, sizeof(topic), "%s/switch/%s/relay_%u/config", oldPrefix.c_str(), mqttHardwareId, (unsigned)i);
+            ok = mqttPublishRaw(topic, "", true) && ok;
+        }
+    }
+    if (!ok) return false;
+    if (currentEnabled) {
+        for (uint8_t i = 0; i < gpioConfig.count; i++) {
+            if (!mqttPublishDiscoveryRelay(i)) return false;
+        }
+    }
+    preferences.begin(NVS_NAMESPACE, false);
+    preferences.putString("mHaPrefix", currentEnabled ? mqttConfig.discoveryPrefix : "");
+    preferences.putString("mHaBase", currentEnabled ? mqttConfig.baseTopic : "");
+    preferences.putUChar("mHaCount", currentEnabled ? gpioConfig.count : 0);
+    preferences.putBool("mHaEnabled", currentEnabled);
+    preferences.end();
+    mqttDiscoveryDirty = false;
+    return true;
+}
+
+static bool mqttClearDiscoveryRecordsNow(const char* prefix, uint8_t count) {
+    if (!prefix || !prefix[0]) return true;
+    if (count > MAX_RELAYS) count = MAX_RELAYS;
+    bool ok = true;
+    for (uint8_t i = 1; i <= count; i++) {
+        char topic[MQTT_DISCOVERY_PREFIX_LENGTH + 96];
+        int n = snprintf(topic, sizeof(topic), "%s/switch/%s/relay_%u/config",
+                         prefix, mqttHardwareId, (unsigned)i);
+        if (n <= 0 || (size_t)n >= sizeof(topic)) { ok = false; continue; }
+        ok = mqttPublishRaw(topic, "", true) && ok;
+    }
+    return ok;
+}
+
+static bool mqttClearPublishedLayoutBeforeChange(const MQTTConfig& candidate) {
+    const bool brokerChanged = strcmp(mqttConfig.brokerHost, candidate.brokerHost) != 0 ||
+                               mqttConfig.port != candidate.port;
+    const bool baseChanged = strcmp(mqttConfig.baseTopic, candidate.baseTopic) != 0;
+    const bool discoveryChanged = strcmp(mqttConfig.discoveryPrefix, candidate.discoveryPrefix) != 0;
+    const bool disabling = mqttConfig.enabled && !candidate.enabled;
+    const bool clearState = disabling || brokerChanged || baseChanged ||
+                            (mqttConfig.retainStates && !candidate.retainStates);
+    const bool clearDiscovery = disabling || brokerChanged || baseChanged ||
+                                discoveryChanged || (mqttConfig.haDiscovery && !candidate.haDiscovery);
+    if (!clearState && !clearDiscovery) return true;
+    if (!mqttClient.connected()) return false;
+
+    preferences.begin(NVS_NAMESPACE, true);
+    String oldHost = preferences.getString("mPubHost", "");
+    uint16_t oldPort = preferences.getUShort("mPubPort", 0);
+    String oldBase = preferences.getString("mPubBase", "");
+    uint8_t oldCount = preferences.getUChar("mPubCount", 0);
+    String oldHaPrefix = preferences.getString("mHaPrefix", "");
+    uint8_t oldHaCount = preferences.getUChar("mHaCount", 0);
+    bool oldHaEnabled = preferences.getBool("mHaEnabled", false);
+    preferences.end();
+
+    const bool oldStateLayoutMatches = oldHost == String(mqttConfig.brokerHost) && oldPort == mqttConfig.port;
+    const char* stateBase = (oldStateLayoutMatches && oldBase.length()) ? oldBase.c_str() : mqttConfig.baseTopic;
+    uint8_t stateCount = (oldStateLayoutMatches && oldCount <= MAX_RELAYS) ? oldCount : gpioConfig.count;
+    bool ok = true;
+    if (clearState) {
+        for (uint8_t i = 1; i <= stateCount; i++) ok = mqttClearRetainedRelay(stateBase, i) && ok;
+        ok = mqttPublishOnBase(stateBase, "state", "", true) && ok;
+        ok = mqttPublishOnBase(stateBase, "system/state", "", true) && ok;
+        ok = mqttPublishOnBase(stateBase, "availability", "offline", true) && ok;
+    }
+    if (clearDiscovery) {
+        if (oldHaEnabled && oldHaPrefix.length()) {
+            ok = mqttClearDiscoveryRecordsNow(oldHaPrefix.c_str(), oldHaCount) && ok;
+        } else if (mqttConfig.haDiscovery) {
+            ok = mqttClearDiscoveryRecordsNow(mqttConfig.discoveryPrefix, gpioConfig.count) && ok;
+        }
+    }
+    return ok;
+}
+
+
+void mqttPrepareFactoryReset() {
+    MQTTConfig disabledConfig = mqttConfig;
+    disabledConfig.enabled = 0;
+    mqttClearPublishedLayoutBeforeChange(disabledConfig);
+    if (mqttClient.connected()) {
+        mqttPublishOnBase(mqttConfig.baseTopic, "availability", "offline", true);
+        mqttClient.disconnect();
+        mqttNetworkClient.stop();
+    }
+}
+
+static bool mqttSubscribeCommands() {
+    char commandTopic[MQTT_TOPIC_LENGTH + 32];
+    if (!mqttMakeTopic(commandTopic, sizeof(commandTopic), mqttConfig.baseTopic, "relay/+/command")) return false;
+    bool ok = mqttClient.subscribe(commandTopic, mqttConfig.commandQoS);
+    if (ok) {
+        mqttSubscriptionsReady = true;
+        mqttSubscriptionsDirty = false;
+        mqttSubscribeFailures = 0;
+    } else {
+        mqttSubscriptionsReady = false;
+        mqttSubscriptionsDirty = true;
+        if (mqttSubscribeFailures < 255) mqttSubscribeFailures++;
+        mqttSetError("Could not subscribe to relay command topic (check broker ACL)");
+    }
+    return ok;
+}
+
+static void mqttConnectNow() {
+    mqttLastAttemptAt = millis();
+    mqttLastStateCode = -1;
+    mqttSetError("Connecting to broker");
+    mqttClient.setServer(mqttConfig.brokerHost, mqttConfig.port);
+    mqttClient.setKeepAlive(mqttConfig.keepAliveSec);
+    mqttClient.setSocketTimeout(2);
+    if (!mqttClient.setBufferSize(MQTT_PACKET_BUFFER_SIZE)) {
+        mqttSetError("Not enough memory for MQTT packet buffer");
+        mqttNextReconnectAt = millis() + (unsigned long)mqttConfig.reconnectIntervalSec * 1000UL;
+        return;
+    }
+    char willTopic[MQTT_TOPIC_LENGTH + 32];
+    if (!mqttMakeTopic(willTopic, sizeof(willTopic), mqttConfig.baseTopic, "availability")) {
+        mqttSetError("Availability topic is too long");
+        mqttNextReconnectAt = millis() + (unsigned long)mqttConfig.reconnectIntervalSec * 1000UL;
+        return;
+    }
+    bool connected = false;
+    if (mqttConfig.username[0]) {
+        const char* password = mqttConfig.password[0] ? mqttConfig.password : NULL;
+        connected = mqttClient.connect(mqttConfig.clientId, mqttConfig.username, password,
+                                       willTopic, mqttConfig.willQoS, true, "offline");
+    } else {
+        connected = mqttClient.connect(mqttConfig.clientId, willTopic,
+                                       mqttConfig.willQoS, true, "offline");
+    }
+    if (connected) {
+        mqttWasConnected = true;
+        mqttReconnectCount++;
+        mqttLastConnectAt = millis();
+        mqttLastStateCode = 0;
+        mqttSetError("Connected");
+        mqttSubscriptionsReady = false;
+        mqttSubscriptionsDirty = true;
+        mqttAvailabilityPending = true;
+        mqttNextAvailabilityAt = 0;
+        mqttRetainedLayoutCleanupPending = true;
+        mqttStateDirty = true;
+        mqttDiscoveryDirty = true;
+        mqttTelemetryPending = true;
+        mqttNextSubscribeAt = 0;
+        mqttNextDiscoveryAt = 0;
+        mqttNextTelemetryAt = 0;
+        mqttLastPublishAttemptAt = 0;
+        mqttNextReconnectAt = 0;
+    } else {
+        mqttWasConnected = false;
+        mqttLastStateCode = mqttClient.state();
+        mqttSetError(mqttStateText(mqttLastStateCode));
+        mqttNextReconnectAt = millis() + (unsigned long)mqttConfig.reconnectIntervalSec * 1000UL;
+        mqttNetworkClient.stop();
+    }
+}
+
+static void mqttHandleCommandResponse(unsigned long now) {
+    if (!mqttCommandResponsePending || !isTimeReached(now, mqttNextCommandResponseAt)) return;
+    if (mqttPublishOnBase(mqttConfig.baseTopic, "command/response", mqttPendingCommandResponse, false)) {
+        mqttCommandResponsePending = false;
+        mqttPendingCommandResponse[0] = '\0';
+    } else {
+        mqttNextCommandResponseAt = now + 2000UL;
+    }
+}
+
+static void mqttConnectedService(unsigned long now) {
+    if (mqttAvailabilityPending && isTimeReached(now, mqttNextAvailabilityAt)) {
+        if (mqttPublishOnBase(mqttConfig.baseTopic, "availability", "online", true)) {
+            mqttAvailabilityPending = false;
+        } else {
+            mqttNextAvailabilityAt = now + 2000UL;
+        }
+    }
+    if (mqttSubscriptionsDirty && isTimeReached(now, mqttNextSubscribeAt)) {
+        mqttNextSubscribeAt = now + 3000UL;
+        mqttSubscribeCommands();
+    }
+    if (mqttRetainedLayoutCleanupPending && isTimeReached(now, mqttLastPublishAttemptAt + 2000UL)) {
+        mqttLastPublishAttemptAt = now;
+        if (mqttCleanupOldRetainedLayout()) {
+            mqttRetainedLayoutCleanupPending = false;
+        } else {
+            mqttSetError("Retained state cleanup failed; will retry");
+        }
+    }
+    if (mqttDiscoveryDirty && isTimeReached(now, mqttNextDiscoveryAt)) {
+        mqttNextDiscoveryAt = now + 5000UL;
+        if (!mqttPublishDiscovery()) mqttSetError("Home Assistant discovery publish failed; will retry");
+    }
+    if (mqttStateDirty && !mqttRetainedLayoutCleanupPending &&
+        isTimeReached(now, mqttLastPublishAttemptAt + 2000UL)) {
+        mqttLastPublishAttemptAt = now;
+        if (mqttPublishStateSnapshot()) {
+            mqttStateDirty = false;
+            mqttPersistPublishedStateLayout();
+        }
+    }
+    if (mqttCommandResponsePending) mqttHandleCommandResponse(now);
+    if (mqttTelemetryPending && isTimeReached(now, mqttNextTelemetryAt)) {
+        if (mqttPublishTelemetry()) {
+            mqttTelemetryPending = false;
+            mqttNextTelemetryAt = now + (unsigned long)mqttConfig.telemetryIntervalSec * 1000UL;
+        } else {
+            mqttNextTelemetryAt = now + 2000UL;
+        }
+    } else if (!mqttTelemetryPending && mqttConfig.telemetryIntervalSec > 0 && isTimeReached(now, mqttNextTelemetryAt)) {
+        if (mqttPublishTelemetry()) mqttNextTelemetryAt = now + (unsigned long)mqttConfig.telemetryIntervalSec * 1000UL;
+        else mqttNextTelemetryAt = now + 2000UL;
+    }
+}
+
+void mqttInitialize() {
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setKeepAlive(mqttConfig.keepAliveSec);
+    mqttClient.setSocketTimeout(2);
+    mqttClient.setBufferSize(MQTT_PACKET_BUFFER_SIZE);
+    mqttNextReconnectAt = 0;
+}
+
+void mqttService() {
+    if (!mqttConfig.enabled || mqttConfig.brokerHost[0] == '\0') {
+        if (mqttClient.connected()) {
+            mqttPublishOnBase(mqttConfig.baseTopic, "availability", "offline", true);
+            mqttClient.disconnect();
+            mqttNetworkClient.stop();
+        }
+        mqttWasConnected = false;
+        mqttSubscriptionsReady = false;
+        if (!mqttConfig.enabled) mqttSetError("MQTT is disabled");
+        else mqttSetError("Broker host is not configured");
+        return;
+    }
+    bool wifiReady = extConfig.sta_enabled && WiFi.status() == WL_CONNECTED && !wifiPausedForScan;
+    if (!wifiReady) {
+        if (mqttClient.connected()) {
+            mqttPublishOnBase(mqttConfig.baseTopic, "availability", "offline", true);
+            mqttClient.disconnect();
+            mqttNetworkClient.stop();
+        }
+        mqttWasConnected = false;
+        mqttSubscriptionsReady = false;
+        mqttSetError("Waiting for Wi-Fi Station connection");
+        return;
+    }
+    if (mqttClient.connected()) {
+        mqttWasConnected = true;
+        if (!mqttClient.loop() || !mqttClient.connected()) {
+            mqttWasConnected = false;
+            mqttSubscriptionsReady = false;
+            mqttLastStateCode = mqttClient.state();
+            mqttSetError(mqttStateText(mqttLastStateCode));
+            mqttNextReconnectAt = millis() + (unsigned long)mqttConfig.reconnectIntervalSec * 1000UL;
+            mqttNetworkClient.stop();
+            return;
+        }
+        mqttConnectedService(millis());
+        return;
+    }
+    if (mqttWasConnected) {
+        mqttWasConnected = false;
+        mqttSubscriptionsReady = false;
+        mqttLastStateCode = mqttClient.state();
+        mqttSetError(mqttStateText(mqttLastStateCode));
+        mqttNextReconnectAt = millis() + (unsigned long)mqttConfig.reconnectIntervalSec * 1000UL;
+        mqttNetworkClient.stop();
+        return;
+    }
+    if (isTimeReached(millis(), mqttNextReconnectAt)) mqttConnectNow();
+}
+
+static const char* mqttStatusText() {
+    if (!mqttConfig.enabled) return "MQTT is disabled";
+    if (mqttConfig.brokerHost[0] == '\0') return "Broker host is not configured";
+    if (wifiPausedForScan) return "Waiting for Wi-Fi scan to finish";
+    if (!extConfig.sta_enabled || WiFi.status() != WL_CONNECTED) return "Waiting for Wi-Fi Station connection";
+    if (mqttClient.connected()) return "Connected";
+    if (strcmp(mqttLastError, "Connected") == 0) return "Disconnected; waiting to reconnect";
+    return mqttLastError;
+}
+
+static void mqttSendJsonError(int status, const char* error) {
+    StaticJsonDocument<192> doc;
+    doc["success"] = false;
+    doc["error"] = error ? error : "MQTT request failed";
+    String response;
+    serializeJson(doc, response);
+    server.send(status, "application/json", response);
+}
+
+void handleGetMQTT() {
+    DynamicJsonDocument doc(1024);
+    doc["enabled"] = mqttConfig.enabled != 0;
+    doc["brokerHost"] = mqttConfig.brokerHost;
+    doc["port"] = mqttConfig.port;
+    doc["clientId"] = mqttConfig.clientId;
+    doc["username"] = mqttConfig.username;
+    doc["passwordSet"] = mqttConfig.password[0] != '\0';
+    doc["baseTopic"] = mqttConfig.baseTopic;
+    doc["keepAliveSec"] = mqttConfig.keepAliveSec;
+    doc["reconnectIntervalSec"] = mqttConfig.reconnectIntervalSec;
+    doc["telemetryIntervalSec"] = mqttConfig.telemetryIntervalSec;
+    doc["retainStates"] = mqttConfig.retainStates != 0;
+    doc["commandQoS"] = mqttConfig.commandQoS;
+    doc["willQoS"] = mqttConfig.willQoS;
+    doc["haDiscovery"] = mqttConfig.haDiscovery != 0;
+    doc["discoveryPrefix"] = mqttConfig.discoveryPrefix;
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+}
+
+void handleGetMQTTStatus() {
+    DynamicJsonDocument doc(768);
+    bool wifiReady = extConfig.sta_enabled && WiFi.status() == WL_CONNECTED && !wifiPausedForScan;
+    doc["enabled"] = mqttConfig.enabled != 0;
+    doc["connected"] = mqttClient.connected();
+    doc["wifiReady"] = wifiReady;
+    doc["brokerHost"] = mqttConfig.brokerHost;
+    doc["port"] = mqttConfig.port;
+    doc["status"] = mqttStatusText();
+    doc["lastError"] = mqttLastError;
+    doc["stateCode"] = mqttClient.connected() ? 0 : mqttLastStateCode;
+    doc["subscriptionsReady"] = mqttSubscriptionsReady;
+    doc["subscribeFailures"] = mqttSubscribeFailures;
+    doc["connectionCount"] = mqttReconnectCount;
+    doc["publishedCount"] = mqttPublishedCount;
+    doc["receivedCount"] = mqttReceivedCount;
+    doc["lastAttemptAgoSec"] = mqttLastAttemptAt ? (unsigned long)((millis() - mqttLastAttemptAt) / 1000UL) : (unsigned long)0xFFFFFFFFUL;
+    doc["lastConnectAgoSec"] = mqttLastConnectAt ? (unsigned long)((millis() - mqttLastConnectAt) / 1000UL) : (unsigned long)0xFFFFFFFFUL;
+    doc["baseTopic"] = mqttConfig.baseTopic;
+    doc["availabilityTopic"] = String(mqttConfig.baseTopic) + "/availability";
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+}
+
+void handleSaveMQTT() {
+    if (!server.hasArg("plain")) { mqttSendJsonError(400, "No JSON body"); return; }
+    DynamicJsonDocument doc(1536);
+    DeserializationError parseError = deserializeJson(doc, server.arg("plain"));
+    if (parseError) { mqttSendJsonError(400, "Bad JSON"); return; }
+    MQTTConfig candidate = mqttConfig;
+    char error[120] = "";
+    if (!mqttParseConfigJson(doc, candidate, false, error, sizeof(error))) {
+        mqttSendJsonError(400, error);
+        return;
+    }
+    if (mqttConfigsEqual(candidate, mqttConfig)) {
+        server.send(200, "application/json", "{\"success\":true,\"changed\":false}");
+        return;
+    }
+    if (!mqttSaveConfigRecord(candidate)) { mqttSendJsonError(500, "Could not persist MQTT settings"); return; }
+    bool retainedCleanupOk = mqttClearPublishedLayoutBeforeChange(candidate);
+    if (mqttClient.connected()) {
+        mqttPublishOnBase(mqttConfig.baseTopic, "availability", "offline", true);
+        mqttClient.disconnect();
+        mqttNetworkClient.stop();
+    }
+    mqttConfig = candidate;
+    mqttWasConnected = false;
+    mqttSubscriptionsReady = false;
+    mqttSubscriptionsDirty = true;
+    mqttAvailabilityPending = true;
+    mqttRetainedLayoutCleanupPending = true;
+    mqttStateDirty = true;
+    mqttDiscoveryDirty = true;
+    mqttTelemetryPending = true;
+    mqttCommandResponsePending = false;
+    mqttPendingCommandResponse[0] = '\0';
+    mqttSubscribeFailures = 0;
+    mqttNextReconnectAt = 0;
+    mqttLastPublishAttemptAt = 0;
+    if (!retainedCleanupOk) mqttSetError("Settings saved; retained cleanup could not be attempted (old broker may still hold retained values)");
+    else mqttSetError(mqttConfig.enabled ? "Settings saved; reconnecting" : "MQTT is disabled");
+    server.send(200, "application/json", "{\"success\":true,\"changed\":true}");
+}
+
+void handleTestMQTT() {
+    if (!server.hasArg("plain")) { mqttSendJsonError(400, "No JSON body"); return; }
+    DynamicJsonDocument doc(1536);
+    DeserializationError parseError = deserializeJson(doc, server.arg("plain"));
+    if (parseError) { mqttSendJsonError(400, "Bad JSON"); return; }
+    MQTTConfig candidate = mqttConfig;
+    char error[120] = "";
+    if (!mqttParseConfigJson(doc, candidate, true, error, sizeof(error))) {
+        mqttSendJsonError(400, error);
+        return;
+    }
+    if (!extConfig.sta_enabled || WiFi.status() != WL_CONNECTED || wifiPausedForScan) {
+        mqttSendJsonError(409, "Wi-Fi Station is disconnected or paused for a scan; broker test cannot run");
+        return;
+    }
+    WiFiClient testNetwork;
+    PubSubClient testClient(testNetwork);
+    testClient.setServer(candidate.brokerHost, candidate.port);
+    testClient.setSocketTimeout(2);
+    testClient.setKeepAlive(candidate.keepAliveSec);
+    if (!testClient.setBufferSize(768)) {
+        mqttSendJsonError(500, "Not enough memory for MQTT test packet buffer");
+        return;
+    }
+    char testId[MQTT_CLIENT_ID_LENGTH + 8];
+    size_t idLen = strlen(candidate.clientId);
+    if (idLen > sizeof(testId) - 6) idLen = sizeof(testId) - 6;
+    memcpy(testId, candidate.clientId, idLen);
+    memcpy(testId + idLen, "_test", 6);
+    bool connected = false;
+    if (candidate.username[0]) {
+        const char* password = candidate.password[0] ? candidate.password : NULL;
+        connected = testClient.connect(testId, candidate.username, password);
+    } else {
+        connected = testClient.connect(testId);
+    }
+    if (!connected) {
+        int state = testClient.state();
+        testNetwork.stop();
+        char response[192];
+        snprintf(response, sizeof(response), "{\"success\":false,\"error\":\"%s\",\"stateCode\":%d}", mqttStateText(state), state);
+        server.send(502, "application/json", response);
+        return;
+    }
+    char testTopic[MQTT_TOPIC_LENGTH + 48];
+    char commandTopic[MQTT_TOPIC_LENGTH + 32];
+    bool subOk = mqttMakeTopic(commandTopic, sizeof(commandTopic), candidate.baseTopic, "relay/+/command") &&
+                 testClient.subscribe(commandTopic, candidate.commandQoS);
+    if (!mqttMakeTopic(testTopic, sizeof(testTopic), candidate.baseTopic, "diagnostics/test")) {
+        testClient.disconnect(); testNetwork.stop(); mqttSendJsonError(400, "Test topic is too long"); return;
+    }
+    char testPayload[128];
+    snprintf(testPayload, sizeof(testPayload), "{\"clientId\":\"%s\",\"result\":\"connect-test\"}", candidate.clientId);
+    bool pubOk = testClient.publish(testTopic, testPayload, false);
+    testClient.disconnect();
+    testNetwork.stop();
+    if (!subOk || !pubOk) {
+        mqttSendJsonError(502, !subOk ? "Connected, but the command SUBSCRIBE packet could not be sent" :
+                                      "Connected, but the diagnostic PUBLISH packet could not be sent");
+        return;
+    }
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"CONNECT succeeded; command SUBSCRIBE and transient diagnostics PUBLISH packets were sent\"}");
+}
+
+void handleReconnectMQTT() {
+    if (!mqttConfig.enabled || mqttConfig.brokerHost[0] == '\0') {
+        mqttSendJsonError(409, "Enable MQTT and configure a broker before reconnecting");
+        return;
+    }
+    if (mqttClient.connected()) {
+        mqttPublishOnBase(mqttConfig.baseTopic, "availability", "offline", true);
+        mqttClient.disconnect();
+        mqttNetworkClient.stop();
+    }
+    mqttWasConnected = false;
+    mqttSubscriptionsReady = false;
+    mqttSubscriptionsDirty = true;
+    mqttAvailabilityPending = true;
+    mqttRetainedLayoutCleanupPending = true;
+    mqttStateDirty = true;
+    mqttDiscoveryDirty = true;
+    mqttTelemetryPending = true;
+    mqttNextReconnectAt = 0;
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Reconnect requested\"}");
+}
+
+void handlePublishMQTT() {
+    if (!mqttClient.connected()) { mqttSendJsonError(409, "MQTT is not connected"); return; }
+    if (!server.hasArg("plain")) { mqttSendJsonError(400, "No JSON body"); return; }
+    DynamicJsonDocument doc(1200);
+    DeserializationError parseError = deserializeJson(doc, server.arg("plain"));
+    if (parseError) { mqttSendJsonError(400, "Bad JSON"); return; }
+    char suffix[MQTT_TOPIC_LENGTH];
+    char payload[513];
+    if (!mqttReadJsonString(doc["topic"], suffix, sizeof(suffix))) { mqttSendJsonError(400, "Topic suffix is missing or too long"); return; }
+    if (!mqttReadJsonString(doc["payload"], payload, sizeof(payload), false)) { mqttSendJsonError(400, "Payload is missing or longer than 512 bytes"); return; }
+    if (suffix[0] == '/' || !mqttTopicPrefixIsValid(suffix, sizeof(suffix) - 1)) {
+        mqttSendJsonError(400, "Topic suffix cannot contain wildcards, spaces, or leading/trailing slash"); return;
+    }
+    bool retain = false;
+    if (doc.containsKey("retain")) {
+        if (!doc["retain"].is<bool>()) { mqttSendJsonError(400, "retain must be true or false"); return; }
+        retain = doc["retain"].as<bool>();
+    }
+    if (!mqttPublishOnBase(mqttConfig.baseTopic, suffix, payload, retain)) {
+        mqttSendJsonError(502, "Publish failed; check connection, topic, packet size, and broker ACL"); return;
+    }
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Message published\"}");
 }
 
 // =============================================================================
@@ -3320,10 +5568,11 @@ void setupWebServer() {
     server.on("/ntp",    HTTP_GET, []() { server.send_P(200, "text/html", ntp_html);    });
     server.on("/ap",     HTTP_GET, []() { server.send_P(200, "text/html", ap_html);     });
     server.on("/gpio",   HTTP_GET, []() { server.send_P(200, "text/html", gpio_html);   });
-    server.on("/mqtt",   HTTP_GET, []() { server.send_P(200, "text/html", mqtt_html);   });
     server.on("/system", HTTP_GET, []() { server.send_P(200, "text/html", system_html); });
+    server.on("/mqtt",   HTTP_GET, []() { server.send_P(200, "text/html", mqtt_html); });
     server.on("/style.css", HTTP_GET, []() { server.send_P(200, "text/css", style_css); });
     server.on("/api/relays",       HTTP_GET,  handleGetRelays);
+    server.on("/api/relay/states", HTTP_GET, handleGetRelayStates);
     server.on("/api/relay/manual", HTTP_POST, handleManualControl);
     server.on("/api/relay/reset",  HTTP_POST, handleResetManual);
     server.on("/api/relay/save",   HTTP_POST, handleSaveRelay);
@@ -3337,6 +5586,20 @@ void setupWebServer() {
     server.on("/api/ntp",      HTTP_GET,  handleGetNTP);
     server.on("/api/ntp",      HTTP_POST, handleSaveNTP);
     server.on("/api/ntp/sync", HTTP_POST, handleSyncNTP);
+    server.on("/api/timezones", HTTP_GET, []() {
+        DynamicJsonDocument doc(4096);
+        JsonArray zones = doc.createNestedArray("timezones");
+        for (uint8_t i = 0; i < TZ_TABLE_SIZE; i++) {
+            JsonObject z = zones.createNestedObject();
+            z["id"]     = i;
+            z["name"]   = TZ_TABLE[i].name;
+            z["offset"] = TZ_TABLE[i].std_offset;
+            z["dst"]    = (TZ_TABLE[i].dst_offset != 0);
+        }
+        String resp;
+        serializeJson(doc, resp);
+        server.send(200, "application/json", resp);
+    });
     server.on("/api/ap", HTTP_GET,  handleGetAP);
     server.on("/api/ap", HTTP_POST, handleSaveAP);
     server.on("/api/gpio",                  HTTP_GET,  handleGetGPIOConfig);
@@ -3345,14 +5608,17 @@ void setupWebServer() {
     server.on("/api/gpio/delete",           HTTP_POST, handleDeleteGPIO);
     server.on("/api/gpio/toggle-active-low", HTTP_POST, handleToggleActiveLow);
     server.on("/api/gpio/global-mode", HTTP_GET, []() {
-        server.send(200, "application/json",
-            "{\"mode\":" + String(extConfig.global_active_mode) + "}");
+    server.send(200, "application/json",
+        "{\"mode\":" + String(extConfig.global_active_mode) + "}");
     });
     server.on("/api/gpio/global-mode",      HTTP_POST, handleGlobalActiveMode);
-    server.on("/api/mqtt",        HTTP_GET,  handleGetMQTT);
-    server.on("/api/mqtt",        HTTP_POST, handleSaveMQTT);
-    server.on("/api/mqtt/toggle", HTTP_POST, handleToggleMQTT);
     server.on("/api/system",        HTTP_GET,  handleGetSystem);
+    server.on("/api/mqtt",          HTTP_GET,  handleGetMQTT);
+    server.on("/api/mqtt",          HTTP_POST, handleSaveMQTT);
+    server.on("/api/mqtt/status",   HTTP_GET,  handleGetMQTTStatus);
+    server.on("/api/mqtt/test",     HTTP_POST, handleTestMQTT);
+    server.on("/api/mqtt/reconnect",HTTP_POST, handleReconnectMQTT);
+    server.on("/api/mqtt/publish",  HTTP_POST, handlePublishMQTT);
     server.on("/api/reset",         HTTP_POST, handleReset);
     server.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
     server.on("/hotspot-detect.html", HTTP_GET, []() {
@@ -3396,39 +5662,70 @@ void handleGetRelays() {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/json", "");
     server.sendContent("[");
-    for (int i = 0; i < gpioConfig.count; i++) {
-        if (i > 0) server.sendContent(",");
+    if (gpioConfig.count > 0) {
         DynamicJsonDocument relayDoc(4096);
-        relayDoc["state"] = lastRelayOutputs[i];
-        relayDoc["manual"] = relayConfigs[i].manualOverride;
-        relayDoc["name"] = String(relayConfigs[i].name);
-        JsonArray schedules = relayDoc.createNestedArray("schedules");
-        for (int s = 0; s < 8; s++) {
-            JsonObject sch = schedules.createNestedObject();
-            sch["startHour"] = relayConfigs[i].schedule.startHour[s];
-            sch["startMinute"] = relayConfigs[i].schedule.startMinute[s];
-            sch["startSecond"] = relayConfigs[i].schedule.startSecond[s];
-            sch["stopHour"] = relayConfigs[i].schedule.stopHour[s];
-            sch["stopMinute"] = relayConfigs[i].schedule.stopMinute[s];
-            sch["stopSecond"] = relayConfigs[i].schedule.stopSecond[s];
-            sch["enabled"] = relayConfigs[i].schedule.enabled[s];
-            sch["days"] = relayConfigs[i].schedule.days[s];
-            sch["monthDays"] = relayConfigs[i].schedule.monthDays[s];
-            sch["monthMask"] = relayConfigs[i].schedule.monthMask[s];
+        for (int i = 0; i < gpioConfig.count; i++) {
+            relayDoc.clear();
+            if (i > 0) server.sendContent(",");
+            relayDoc["state"] = lastRelayOutputs[i];
+            relayDoc["manual"] = relayConfigs[i].manualOverride;
+            relayDoc["name"] = String(relayConfigs[i].name);
+            relayDoc["pin"] = getRelayPin(i);
+            JsonArray schedules = relayDoc.createNestedArray("schedules");
+            for (int s = 0; s < 8; s++) {
+                JsonObject sch = schedules.createNestedObject();
+                sch["startHour"] = relayConfigs[i].schedule.startHour[s];
+                sch["startMinute"] = relayConfigs[i].schedule.startMinute[s];
+                sch["startSecond"] = relayConfigs[i].schedule.startSecond[s];
+                sch["stopHour"] = relayConfigs[i].schedule.stopHour[s];
+                sch["stopMinute"] = relayConfigs[i].schedule.stopMinute[s];
+                sch["stopSecond"] = relayConfigs[i].schedule.stopSecond[s];
+                sch["enabled"] = relayConfigs[i].schedule.enabled[s];
+                sch["days"] = relayConfigs[i].schedule.days[s];
+                sch["monthDays"] = relayConfigs[i].schedule.monthDays[s];
+                sch["monthMask"] = relayConfigs[i].schedule.monthMask[s];
+            }
+            String chunk;
+            serializeJson(relayDoc, chunk);
+            server.sendContent(chunk);
+            yield();
         }
-        String chunk;
-        serializeJson(relayDoc, chunk);
-        server.sendContent(chunk);
-        yield();
     }
     server.sendContent("]");
 }
 
+void handleGetRelayStates() {
+    DynamicJsonDocument doc(1024);
+    doc["count"] = gpioConfig.count;
+    JsonArray relays = doc.createNestedArray("relays");
+    for (uint8_t i = 0; i < gpioConfig.count; i++) {
+        JsonObject relay = relays.createNestedObject();
+        relay["state"] = lastRelayOutputs[i];
+        relay["manual"] = relayConfigs[i].manualOverride;
+    }
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+}
+
+
 void handleManualControl() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     StaticJsonDocument<128> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>() ||
+        !doc.containsKey("state") || !doc["state"].is<bool>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay/state\"}");
+        return;
+    }
     int relay = doc["relay"];
     bool state = doc["state"];
     if (relay >= 0 && relay < gpioConfig.count) {
@@ -3440,8 +5737,6 @@ void handleManualControl() {
         lastDebouncedStateGlobal[relay] = state;
         lastStateChangeGlobal[relay] = millis();
         saveConfiguration();
-        mqttPublishPending = true;
-        mqttPendingRelay = relay;
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
@@ -3449,17 +5744,33 @@ void handleManualControl() {
 }
 
 void handleResetManual() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     StaticJsonDocument<64> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay\"}");
+        return;
+    }
     int relay = doc["relay"];
     if (relay >= 0 && relay < gpioConfig.count) {
         relayConfigs[relay].manualOverride = false;
         updateScheduleCache();
+        mqttMarkStateDirty();
+        bool targetState = scheduleActiveCache[relay];
+        setRelayOutput(relay, targetState);
+        lastRelayOutputs[relay] = targetState;
+        lastDebouncedStateGlobal[relay] = targetState;
+        lastStateChangeGlobal[relay] = millis();
         saveConfiguration();
-        mqttPublishPending = true;
-        mqttPendingRelay = relay;
+        processRelaySchedules();
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
@@ -3467,13 +5778,29 @@ void handleResetManual() {
 }
 
 void handleSaveRelay() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     DynamicJsonDocument doc(4096);
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay\"}");
+        return;
+    }
     int relay = doc["relay"];
     if (relay < 0 || relay >= gpioConfig.count) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
+        return;
+    }
+    if (!doc.containsKey("schedules") || !doc["schedules"].is<JsonArray>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid schedules\"}");
         return;
     }
     JsonArray schedules = doc["schedules"].as<JsonArray>();
@@ -3502,7 +5829,10 @@ void handleSaveRelay() {
         } else {
             relayConfigs[relay].schedule.days[s] = DAY_ALL;
         }
-        uint32_t rawMonthDays = sch["monthDays"] | 0;
+        uint32_t rawMonthDays = 0x7FFFFFFFUL;
+        if (sch.containsKey("monthDays") && sch["monthDays"].is<uint32_t>()) {
+            rawMonthDays = sch["monthDays"].as<uint32_t>();
+        }
         relayConfigs[relay].schedule.monthDays[s] = rawMonthDays & 0x7FFFFFFFUL;
         if (sch.containsKey("monthMask")) {
             relayConfigs[relay].schedule.monthMask[s] = sch["monthMask"].as<uint16_t>() & 0x0FFF;
@@ -3525,24 +5855,50 @@ void handleSaveRelay() {
     }
     saveConfiguration();
     updateScheduleCache();
-    mqttPublishPending = true;
-    mqttPendingRelay = relay;
     server.send(200, "application/json", "{\"success\":true}");
 }
 
 void handleRelayName() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     StaticJsonDocument<128> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("relay") || !doc["relay"].is<int>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid relay\"}");
+        return;
+    }
     int relay = doc["relay"];
     const char* name = doc["name"];
     if (relay >= 0 && relay < gpioConfig.count && name) {
-        strncpy(relayConfigs[relay].name, name, 15);
-        relayConfigs[relay].name[15] = '\0';
+        size_t nlen = strlen(name);
+        if (nlen > 15) {
+            nlen = 15;
+            while (nlen > 0 && (((uint8_t)name[nlen]) & 0xC0) == 0x80) {
+                nlen--;
+            }
+            if (nlen == 0) {
+                const char* def = "Relay";
+                memcpy(relayConfigs[relay].name, def, strlen(def));
+                relayConfigs[relay].name[strlen(def)] = '\0';
+                saveConfiguration();
+        mqttMarkStateDirty();
+        mqttMarkDiscoveryDirty();
+                server.send(200, "application/json", "{\"success\":true}");
+                return;
+            }
+        }
+        memcpy(relayConfigs[relay].name, name, nlen);
+        relayConfigs[relay].name[nlen] = '\0';
         saveConfiguration();
-        mqttPublishPending = true;
-        mqttPendingRelay = relay;
+        mqttMarkStateDirty();
+        mqttMarkDiscoveryDirty();
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid data\"}");
@@ -3551,6 +5907,8 @@ void handleRelayName() {
 
 void handleGetTime() {
     String ts = "--:--:--";
+    String ds = "--/--/----";
+    String ws = "";
     uint64_t utcEp = getCurrentEpoch();
     if (utcEp > MIN_UNIX_TIME_64) {
         uint64_t localEp = getLocalEpoch(utcEp);
@@ -3559,19 +5917,38 @@ void handleGetTime() {
             char buf[12];
             sprintf(buf, "%02d:%02d:%02d", t->tm_hour, t->tm_min, t->tm_sec);
             ts = buf;
+            char dbuf[13];
+            sprintf(dbuf, "%02d/%02d/%04d", t->tm_mon + 1, t->tm_mday,
+                    t->tm_year + 1900);
+            ds = dbuf;
+            static const char* WD[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+            if (t->tm_wday >= 0 && t->tm_wday <= 6) ws = WD[t->tm_wday];
         }
     }
     String timeSourceStr = "none";
     if (timeSource == TIME_SOURCE_NTP) timeSourceStr = "ntp";
     else if (timeSource == TIME_SOURCE_BROWSER) timeSourceStr = "browser";
     else if (timeSource == TIME_SOURCE_RTC) timeSourceStr = "rtc";
-    unsigned long rtcSyncAge = (lastRTCDSync > 0) ? (millis() - lastRTCDSync) / 1000UL : 0xFFFFFFFF;
-    String resp = "{\"time\":\"" + ts + "\",\"wifi\":" +
-                  String(wifiConnected ? "true" : "false") +
+    unsigned long rtcSyncAge = (lastRTCDSync > 0)
+        ? (millis() - lastRTCDSync) / 1000UL
+        : 0xFFFFFFFFUL;
+    unsigned long ntpSyncAge = (lastNTPSync > 0)
+        ? (millis() - lastNTPSync) / 1000UL
+        : 0xFFFFFFFFUL;
+    int32_t dstOff = (utcEp > MIN_UNIX_TIME_64) ? currentDstOffset(utcEp) : 0;
+    bool dstOn = (dstOff != 0);
+    String tzName = String(sysConfig.tz_name);
+    String resp = "{\"time\":\"" + ts + "\",\"date\":\"" + ds + "\",\"weekday\":\"" + ws + "\",\"wifi\":" +
+                  String(wifiConnected ? "true" : "false") + ",\"ntp\":" +
+                  String((timeSource == TIME_SOURCE_NTP) ? "true" : "false") +
                   ",\"timeSource\":\"" + timeSourceStr +
                   "\",\"rtcPresent\":" + String(rtcPresent ? "true" : "false") +
                   ",\"rtcSynced\":" + String(rtcTimeValid ? "true" : "false") +
-                  ",\"rtcSyncAge\":" + String(rtcSyncAge) + "}";
+                  ",\"rtcSyncAge\":" + String(rtcSyncAge) +
+                  ",\"ntpSyncAge\":" + String(ntpSyncAge) +
+                  ",\"dstActive\":" + String(dstOn ? "true" : "false") +
+                  ",\"dstOffset\":" + String(dstOff) +
+                  ",\"tzName\":\"" + tzName + "\"}";
     server.send(200, "application/json", resp);
 }
 
@@ -3588,10 +5965,16 @@ void handleGetWiFi() {
 }
 
 void handleSaveWiFi() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     StaticJsonDocument<256> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
     if (doc.containsKey("sta_enabled")) {
         bool enable = doc["sta_enabled"];
         setWiFiStationEnabled(enable);
@@ -3642,13 +6025,15 @@ void handleSaveWiFi() {
         if (extConfig.sta_enabled && (ssidChanged || passChanged)) {
             wifiPausedForScan = false;
             WiFi.disconnect(false, false);
-            delay(500);  
+            delay(500);
             wifiConnected = false;
             wifiConnecting = true;
             wifiConnectStart = millis();
             wifiReconnectAttempts = 0;
             wifiGiveUpUntil = 0;
-            if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+            if (WiFi.getMode() != WIFI_AP_STA) {
+                WiFi.mode(WIFI_AP_STA);
+            }
             WiFi.begin(sysConfig.sta_ssid, sysConfig.sta_password);
         }
         server.send(200, "application/json", "{\"success\":true}");
@@ -3662,12 +6047,16 @@ void handleWiFiScanStart() {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"WiFi station is disabled\"}");
         return;
     }
-    if (wifiConnecting && !wifiConnected && !wifiPausedForScan) pauseWiFiForScan();
+    if (wifiConnecting && !wifiConnected && !wifiPausedForScan) {
+        pauseWiFiForScan();
+    }
     if (!scanInProgress) {
         scanInProgress  = true;
         scanResultCount = -1;
         scanStartTime   = millis();
-        if (WiFi.getMode() == WIFI_AP) WiFi.mode(WIFI_AP_STA);
+        if (WiFi.getMode() == WIFI_AP) {
+            WiFi.mode(WIFI_AP_STA);
+        }
         WiFi.scanNetworks(true, true);
     }
     server.send(202, "application/json", "{\"scanning\":true}");
@@ -3682,7 +6071,9 @@ void handleWiFiScanResults() {
         }
         scanResultCount = (n >= 0) ? n : -1;
         scanInProgress  = false;
-        if (wifiPausedForScan) wifiPauseUntil = millis() + 5000;
+        if (wifiPausedForScan) {
+            wifiPauseUntil = millis() + 5000;
+        }
     }
     if (scanResultCount < 0) {
         server.send(200, "application/json", "{\"scanning\":false,\"networks\":[]}");
@@ -3707,54 +6098,125 @@ void handleWiFiScanResults() {
 }
 
 void handleGetNTP() {
-    DynamicJsonDocument doc(256);
+    DynamicJsonDocument doc(512);
     doc["ntpServer"] = sysConfig.ntp_server;
     doc["gmtOffset"] = sysConfig.gmt_offset;
     doc["daylightOffset"] = sysConfig.daylight_offset;
     doc["syncHours"] = extConfig.ntp_sync_hours;
     doc["globalActiveMode"] = extConfig.global_active_mode;
+    doc["tzName"] = sysConfig.tz_name;
+    doc["tzRuleId"] = sysConfig.tz_rule_id;
+    doc["tzAutoDst"] = sysConfig.tz_auto_dst ? 1 : 0;
+    uint64_t now = getCurrentEpoch();
+    int32_t dstOff = (now > MIN_UNIX_TIME_64) ? currentDstOffset(now) : 0;
+    doc["dstOffset"] = dstOff;
+    doc["dstActive"] = (dstOff != 0);
     String resp;
     serializeJson(doc, resp);
     server.send(200, "application/json", resp);
 }
 
 void handleSaveNTP() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
-    StaticJsonDocument<256> doc;
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
+    StaticJsonDocument<384> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
-    bool changed = false;
-    if (doc.containsKey("ntpServer")) {
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    bool hasNtpServer = doc.containsKey("ntpServer");
+    bool hasTzName    = doc.containsKey("tzName");
+    bool hasGmtOffset = doc.containsKey("gmtOffset") && !hasTzName;
+    bool hasDstOffset = doc.containsKey("daylightOffset") && !hasTzName;
+    bool hasSyncHours = doc.containsKey("syncHours");
+    if (hasNtpServer) {
         const char* srv = doc["ntpServer"];
         if (!srv || strlen(srv) == 0 || strlen(srv) >= 48) {
             server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid NTP server\"}");
             return;
         }
-        strncpy(sysConfig.ntp_server, srv, 47);
+    }
+    uint8_t newTzId = 0;
+    const char* newTzName = nullptr;
+    if (hasTzName) {
+        newTzName = doc["tzName"];
+        if (!newTzName || strlen(newTzName) == 0 || strlen(newTzName) >= 32) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"Invalid timezone name\"}");
+            return;
+        }
+        if (strcmp(newTzName, "Manual") != 0) {
+            newTzId = findTzByName(newTzName);
+            if (newTzId >= TZ_TABLE_SIZE) {
+                server.send(400, "application/json",
+                    "{\"success\":false,\"error\":\"Unknown timezone\"}");
+                return;
+            }
+        } else {
+            newTzId = TZ_TABLE_SIZE;
+        }
+    }
+    int32_t newGmtOffset = 0;
+    if (hasGmtOffset) {
+        newGmtOffset = doc["gmtOffset"] | 0;
+        if (newGmtOffset > 50400) newGmtOffset = 50400;
+        if (newGmtOffset < -50400) newGmtOffset = -50400;
+    }
+    int32_t newDstOffset = 0;
+    if (hasDstOffset) {
+        newDstOffset = doc["daylightOffset"] | 0;
+        if (newDstOffset > 7200) newDstOffset = 7200;
+        if (newDstOffset < -7200) newDstOffset = -7200;
+    }
+    uint8_t newSyncHours = 0;
+    if (hasSyncHours) {
+        newSyncHours = doc["syncHours"];
+        if (newSyncHours < 1 || newSyncHours > 24) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"syncHours must be 1-24\"}");
+            return;
+        }
+    }
+    bool changed = false;
+    bool tzChanged = false;
+    if (hasNtpServer) {
+        strncpy(sysConfig.ntp_server, doc["ntpServer"], 47);
         sysConfig.ntp_server[47] = '\0';
         changed = true;
     }
-    if (doc.containsKey("gmtOffset")) {
-        int32_t gmt = doc["gmtOffset"] | 0;
-        if (gmt > 50400) gmt = 50400;
-        if (gmt < -50400) gmt = -50400;
-        sysConfig.gmt_offset = gmt;
-        changed = true;
-    }
-    if (doc.containsKey("daylightOffset")) {
-        int32_t dst = doc["daylightOffset"] | 0;
-        if (dst > 7200) dst = 7200;
-        if (dst < -7200) dst = -7200;
-        sysConfig.daylight_offset = dst;
-        changed = true;
-    }
-    if (doc.containsKey("syncHours")) {
-        uint8_t h = doc["syncHours"];
-        if (h < 1 || h > 24) {
-            server.send(400, "application/json", "{\"success\":false,\"error\":\"syncHours must be 1-24\"}");
-            return;
+    if (newTzName) {
+        strncpy(sysConfig.tz_name, newTzName, 31);
+        sysConfig.tz_name[31] = '\0';
+        if (newTzId < TZ_TABLE_SIZE) {
+            sysConfig.tz_rule_id  = newTzId;
+            sysConfig.gmt_offset  = TZ_TABLE[newTzId].std_offset;
+            sysConfig.daylight_offset = 0;
+            sysConfig.tz_auto_dst = 1;
+        } else {
+            sysConfig.tz_rule_id  = TZ_TABLE_SIZE;
+            sysConfig.tz_auto_dst = 0;
+            sysConfig.daylight_offset = 0;
         }
-        extConfig.ntp_sync_hours = h;
+        changed = true;
+        tzChanged = true;
+    }
+    if (hasGmtOffset) {
+        sysConfig.gmt_offset = newGmtOffset;
+        strcpy(sysConfig.tz_name, "Manual");
+        sysConfig.tz_auto_dst = 0;
+        changed = true;
+        tzChanged = true;
+    }
+    if (hasDstOffset) {
+        sysConfig.daylight_offset = newDstOffset;
+        changed = true;
+        tzChanged = true;
+    }
+    if (hasSyncHours) {
+        extConfig.ntp_sync_hours = newSyncHours;
         saveExtConfig();
         changed = true;
     }
@@ -3763,7 +6225,11 @@ void handleSaveNTP() {
         return;
     }
     saveConfiguration();
-    if (doc.containsKey("ntpServer")) {
+    if (tzChanged) {
+        invalidateDstCache();
+        updateScheduleCache();
+    }
+    if (hasNtpServer) {
         ntpAsyncStage = 0;
         ntpAsyncState = NTP_STATE_IDLE;
         ntpRetryCount = 0;
@@ -3801,17 +6267,34 @@ void handleGetAP() {
 }
 
 void handleSaveAP() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
-    StaticJsonDocument<256> doc;
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
+    StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
     const char* ssid = doc["ap_ssid"];
     const char* pw   = doc["ap_password"];
-    bool ssidChanged = false, passChanged = false, channelChanged = false, hiddenChanged = false;
+    bool ssidChanged = false;
+    bool passChanged = false;
+    bool channelChanged = false;
+    bool hiddenChanged = false;
     if (ssid && strlen(ssid) > 0 && strlen(ssid) < 32) {
         ssidChanged = (strcmp(sysConfig.ap_ssid, ssid) != 0);
         strncpy(sysConfig.ap_ssid, ssid, 31);
         sysConfig.ap_ssid[31] = '\0';
+    } else if (ssid && strlen(ssid) == 0) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"SSID cannot be empty\"}");
+        return;
+    } else if (ssid && strlen(ssid) >= 32) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"SSID must be 31 characters or less\"}");
+        return;
     }
     if (pw) {
         size_t pwLen = strlen(pw);
@@ -3824,6 +6307,10 @@ void handleSaveAP() {
             passChanged = (strcmp(sysConfig.ap_password, pw) != 0);
             strncpy(sysConfig.ap_password, pw, 31);
             sysConfig.ap_password[31] = '\0';
+        } else if (pwLen > 31) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"Password must be 31 characters or less\"}");
+            return;
         } else {
             server.send(400, "application/json",
                 "{\"success\":false,\"error\":\"Password must be 8-31 characters or empty\"}");
@@ -3844,13 +6331,18 @@ void handleSaveAP() {
             hiddenChanged = true;
         }
     }
-    saveConfiguration();
-    saveExtConfig();
+    if (ssidChanged || passChanged) saveConfiguration();
+    if (channelChanged || hiddenChanged) saveExtConfig();
     bool needsRestart = ssidChanged || passChanged || channelChanged || hiddenChanged;
     if (needsRestart) {
         server.send(200, "application/json", "{\"success\":true,\"restarted\":true}");
         server.client().flush();
         delay(200);
+        yield();
+        server.client().flush();
+        delay(1200);
+        yield();
+        server.client().flush();
         healer.restartAPIfNeeded(true);
     } else {
         server.send(200, "application/json", "{\"success\":true,\"restarted\":false}");
@@ -3858,7 +6350,7 @@ void handleSaveAP() {
 }
 
 void handleGetSystem() {
-    DynamicJsonDocument doc(2048);
+    DynamicJsonDocument doc(3072);
     doc["ip"] = WiFi.localIP().toString();
     doc["ap_ip"] = WiFi.softAPIP().toString();
     doc["uptime"] = (uint64_t)(esp_timer_get_time() / 1000000ULL);
@@ -3869,15 +6361,40 @@ void handleGetSystem() {
     String timeSourceStr = "None";
     if (timeSource == TIME_SOURCE_NTP) timeSourceStr = "NTP";
     else if (timeSource == TIME_SOURCE_BROWSER) timeSourceStr = "Browser";
-    else if (timeSource == TIME_SOURCE_RTC) timeSourceStr = "RTC";
+    else if (timeSource == TIME_SOURCE_RTC) timeSourceStr = rtcPresent ? "DS3231" : "Internal RTC";
     doc["timeSource"] = timeSourceStr;
+    if (timeSource == TIME_SOURCE_NTP) {
+        doc["syncDirection"] = rtcPresent ? "NTP \u2192 RTC \u2192 DS3231" : "NTP \u2192 Internal RTC";
+    } else if (timeSource == TIME_SOURCE_BROWSER) {
+        doc["syncDirection"] = rtcPresent ? "Browser \u2192 RTC \u2192 DS3231" : "Browser \u2192 Internal RTC";
+    } else if (timeSource == TIME_SOURCE_RTC && rtcPresent) {
+        doc["syncDirection"] = "DS3231 \u2192 Internal RTC";
+    } else if (timeSource == TIME_SOURCE_RTC && !rtcPresent) {
+        doc["syncDirection"] = "Internal RTC (NVS)";
+    } else {
+        doc["syncDirection"] = "None";
+    }
     doc["ntpServer"] = sysConfig.ntp_server;
     doc["ntpSyncAge"] = lastNTPSync > 0 ? (unsigned long)((millis() - lastNTPSync) / 1000UL) : (unsigned long)0xFFFFFFFF;
     doc["browserSyncAge"] = lastBrowserSync > 0 ? (unsigned long)((millis() - lastBrowserSync) / 1000UL) : (unsigned long)0xFFFFFFFF;
     doc["rtcSyncAge"] = lastRTCDSync > 0 ? (unsigned long)((millis() - lastRTCDSync) / 1000UL) : (unsigned long)0xFFFFFFFF;
     doc["wifiConnected"] = wifiConnected;
+    doc["wifiSSID"] = sysConfig.sta_ssid;
     doc["rssi"] = wifiConnected ? (int)WiFi.RSSI() : 0;
+    doc["version"] = EEPROM_VERSION;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && defined(ESP_ARDUINO_VERSION_MINOR)
+  #if (ESP_ARDUINO_VERSION_MAJOR > 2) || \
+      (ESP_ARDUINO_VERSION_MAJOR == 2 && ESP_ARDUINO_VERSION_MINOR >= 1)
+    {
+        const char* cm = ESP.getChipModel();
+        doc["chipModel"] = (cm && cm[0]) ? cm : "ESP32S3";
+    }
+  #else
     doc["chipModel"] = "ESP32S3";
+  #endif
+#else
+    doc["chipModel"] = "ESP32S3";
+#endif
     doc["mdnsHostname"] = getMDNSHostname();
     doc["mdnsStarted"] = mdnsStarted;
     doc["relayCount"] = gpioConfig.count;
@@ -3887,9 +6404,21 @@ void handleGetSystem() {
     doc["globalActiveMode"] = extConfig.global_active_mode;
     doc["rtcPresent"] = rtcPresent;
     doc["staEnabled"] = extConfig.sta_enabled ? true : false;
+    doc["mqttEnabled"] = mqttConfig.enabled != 0;
+    doc["mqttConnected"] = mqttClient.connected();
+    doc["mqttStatus"] = mqttStatusText();
+    doc["tzName"] = sysConfig.tz_name;
+    doc["tzAutoDst"] = sysConfig.tz_auto_dst ? 1 : 0;
+    uint64_t nowEp = getCurrentEpoch();
+    int32_t dstOff = (nowEp > MIN_UNIX_TIME_64) ? currentDstOffset(nowEp) : 0;
+    doc["dstActive"] = (dstOff != 0);
+    doc["dstOffset"] = dstOff;
     float rtcTempVal = getRTCTemperature();
-    if (isnan(rtcTempVal)) doc["rtcTemp"] = nullptr;
-    else doc["rtcTemp"] = rtcTempVal;
+    if (isnan(rtcTempVal)) {
+        doc["rtcTemp"] = nullptr;
+    } else {
+        doc["rtcTemp"] = rtcTempVal;
+    }
     String resp;
     serializeJson(doc, resp);
     server.send(200, "application/json", resp);
@@ -3903,6 +6432,7 @@ void handleReset() {
 void handleFactoryReset() {
     server.send(200, "application/json",
         "{\"success\":true,\"message\":\"Factory reset complete. Device will restart with default settings.\"}");
+    mqttPrepareFactoryReset();
     server.client().flush();
     delay(500);
     preferences.begin(NVS_NAMESPACE, false);
@@ -3926,23 +6456,41 @@ void handleGetGPIOConfig() {
         activeLow.add(gpioConfig.activeLow[i]);
     }
     JsonArray available = doc.createNestedArray("availablePins");
-    for (int p = 0; p < 16; p++) available.add(DEFAULT_RELAY_PINS[p]);
+    for (int p = 0; p < 16; p++) {
+        available.add(DEFAULT_RELAY_PINS[p]);
+    }
     String resp;
     serializeJson(doc, resp);
     server.send(200, "application/json", resp);
 }
 
 void handleSaveGPIOConfig() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     StaticJsonDocument<1024> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("pins") || !doc["pins"].is<JsonArray>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Missing or invalid pins array\"}");
+        return;
+    }
     JsonArray pins = doc["pins"].as<JsonArray>();
     uint8_t newCount = pins.size();
+    if (newCount == 0) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Pins array cannot be empty\"}");
+        return;
+    }
     if (newCount > MAX_RELAYS) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Too many pins\"}");
         return;
     }
+    // change gpio
+    static const uint8_t SAFE_PINS[] = {4, 5, 6, 7, 11, 12, 13, 14, 1, 2, 42, 41, 47, 21, 20, 19};
     uint8_t parsed[MAX_RELAYS] = {0};
     uint8_t pi = 0;
     for (JsonVariant pv : pins) {
@@ -3987,13 +6535,32 @@ void handleSaveGPIOConfig() {
     gpioConfig.count = newCount;
     int idx = 0;
     for (JsonVariant pin : pins) {
-        gpioConfig.pins[idx] = pin.as<uint8_t>();
+        uint8_t newPinVal = pin.as<uint8_t>();
+        gpioConfig.pins[idx] = newPinVal;
         if (idx < MAX_RELAYS) {
-            relayConfigs[idx].manualOverride = oldManualOverride[idx];
-            relayConfigs[idx].manualState = oldManualState[idx];
-            strcpy(relayConfigs[idx].name, oldNames[idx]);
-            relayConfigs[idx].schedule = oldSchedules[idx];
-            gpioConfig.activeLow[idx] = oldActiveLow[idx];
+            int matchIdx = -1;
+            for (uint8_t k = 0; k < oldCount; k++) {
+                if (oldPins[k] == newPinVal) { matchIdx = k; break; }
+            }
+            if (matchIdx >= 0) {
+                relayConfigs[idx].manualOverride = oldManualOverride[matchIdx];
+                relayConfigs[idx].manualState    = oldManualState[matchIdx];
+                strncpy(relayConfigs[idx].name, oldNames[matchIdx], 15);
+                relayConfigs[idx].name[15] = '\0';
+                relayConfigs[idx].schedule       = oldSchedules[matchIdx];
+                gpioConfig.activeLow[idx]        = oldActiveLow[matchIdx];
+            } else {
+                relayConfigs[idx].manualOverride = false;
+                relayConfigs[idx].manualState    = false;
+                snprintf(relayConfigs[idx].name, 16, "Relay %d", idx + 1);
+                memset(&relayConfigs[idx].schedule, 0, sizeof(TimerSchedule));
+                for (int s = 0; s < 8; s++) {
+                    relayConfigs[idx].schedule.days[s]      = DAY_ALL;
+                    relayConfigs[idx].schedule.monthDays[s] = 0x7FFFFFFFUL;
+                    relayConfigs[idx].schedule.monthMask[s] = MONTH_ALL;
+                }
+                gpioConfig.activeLow[idx] = true;
+            }
             relayConfigs[idx].magic = RELAY_CONFIG_MAGIC;
         }
         idx++;
@@ -4002,10 +6569,26 @@ void handleSaveGPIOConfig() {
         initScheduleDefaults(i);
         gpioConfig.activeLow[i] = true;
     }
+    for (uint8_t i = 0; i < oldCount; i++) {
+        bool stillUsed = false;
+        for (uint8_t j = 0; j < newCount; j++) {
+            if (oldPins[i] == parsed[j]) { stillUsed = true; break; }
+        }
+        if (!stillUsed && oldPins[i] != 0xFF) {
+            bool wasActiveLow = oldActiveLow[i];
+            if (extConfig.global_active_mode == 1) wasActiveLow = true;
+            else if (extConfig.global_active_mode == 2) wasActiveLow = false;
+            digitalWrite(oldPins[i], wasActiveLow ? HIGH : LOW);
+            pinMode(oldPins[i], INPUT);
+        }
+    }
     for (uint8_t i = 0; i < gpioConfig.count; i++) {
         pinMode(gpioConfig.pins[i], OUTPUT);
-        bool preserve = (i < oldCount) && (oldPins[i] == gpioConfig.pins[i]);
-        bool state = preserve ? oldRelayOutputs[i] : false;
+        int matchIdx = -1;
+        for (uint8_t k = 0; k < oldCount; k++) {
+            if (oldPins[k] == gpioConfig.pins[i]) { matchIdx = k; break; }
+        }
+        bool state = (matchIdx >= 0) ? oldRelayOutputs[matchIdx] : false;
         setRelayOutput(i, state);
         lastRelayOutputs[i] = state;
         lastDebouncedStateGlobal[i] = state;
@@ -4014,16 +6597,27 @@ void handleSaveGPIOConfig() {
     saveGPIOConfig();
     saveConfiguration();
     updateScheduleCache();
-    mqttPublishPending = true;
-    mqttPendingRelay = -1;
+    mqttMarkStateDirty();
+    mqttMarkDiscoveryDirty();
     server.send(200, "application/json", "{\"success\":true,\"count\":" + String(newCount) + "}");
 }
 
 void handleAddGPIO() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     StaticJsonDocument<128> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("pin") || !doc["pin"].is<int>()) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Missing or invalid pin field\"}");
+        return;
+    }
     int rawPin = doc["pin"] | -1;
     if (rawPin < 0 || rawPin > 48) {
         server.send(400, "application/json",
@@ -4031,6 +6625,8 @@ void handleAddGPIO() {
         return;
     }
     uint8_t newPin = (uint8_t)rawPin;
+    // change gpio
+    static const uint8_t SAFE_PINS[] = {4, 5, 6, 7, 11, 12, 13, 14, 1, 2, 42, 41, 47, 21, 20, 19};
     bool pinAllowed = false;
     for (uint8_t sp : SAFE_PINS) {
         if (sp == newPin) { pinAllowed = true; break; }
@@ -4062,22 +6658,39 @@ void handleAddGPIO() {
     saveGPIOConfig();
     saveConfiguration();
     updateScheduleCache();
-    mqttPublishPending = true;
-    mqttPendingRelay = -1;
+    mqttMarkStateDirty();
+    mqttMarkDiscoveryDirty();
     server.send(200, "application/json", "{\"success\":true,\"count\":" + String(gpioConfig.count) + "}");
 }
 
 void handleDeleteGPIO() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     StaticJsonDocument<128> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("index") || !doc["index"].is<uint8_t>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Missing or invalid index field\"}");
+        return;
+    }
     uint8_t index = doc["index"];
     if (index >= gpioConfig.count) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid index\"}");
         return;
     }
+    uint8_t removedPin = gpioConfig.pins[index];
+    bool removedActiveLow = gpioConfig.activeLow[index];
+    if (extConfig.global_active_mode == 1) removedActiveLow = true;
+    else if (extConfig.global_active_mode == 2) removedActiveLow = false;
     setRelayOutput(index, false);
+    delay(1);
+    digitalWrite(removedPin, removedActiveLow ? HIGH : LOW);
+    pinMode(removedPin, INPUT);
     for (uint8_t i = index; i < gpioConfig.count - 1; i++) {
         gpioConfig.pins[i] = gpioConfig.pins[i + 1];
         gpioConfig.activeLow[i] = gpioConfig.activeLow[i + 1];
@@ -4097,16 +6710,26 @@ void handleDeleteGPIO() {
     saveGPIOConfig();
     saveConfiguration();
     updateScheduleCache();
-    mqttPublishPending = true;
-    mqttPendingRelay = -1;
+    mqttMarkStateDirty();
+    mqttMarkDiscoveryDirty();
     server.send(200, "application/json", "{\"success\":true,\"count\":" + String(gpioConfig.count) + "}");
 }
 
 void handleToggleActiveLow() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     StaticJsonDocument<128> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("index") || !doc["index"].is<uint8_t>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Missing or invalid index field\"}");
+        return;
+    }
     uint8_t index = doc["index"];
     if (index >= gpioConfig.count) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid index\"}");
@@ -4118,17 +6741,28 @@ void handleToggleActiveLow() {
     pinMode(gpioConfig.pins[index], OUTPUT);
     setRelayOutput(index, logicalState);
     lastRelayOutputs[index] = logicalState;
-    mqttPublishPending = true;
-    mqttPendingRelay = index;
     server.send(200, "application/json",
         "{\"success\":true,\"activeLow\":" + String(gpioConfig.activeLow[index] ? "true" : "false") + "}");
 }
 
+// =============================================================================
+//  GLOBAL ACTIVE MODE HANDLER
+// =============================================================================
 void handleGlobalActiveMode() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}");
+        return;
+    }
     StaticJsonDocument<64> doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
+    if (err) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}");
+        return;
+    }
+    if (!doc.containsKey("mode") || !doc["mode"].is<uint8_t>()) {
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Missing or invalid mode field\"}");
+        return;
+    }
     uint8_t mode = doc["mode"];
     if (mode > 2) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid mode (0-2)\"}");
@@ -4140,125 +6774,6 @@ void handleGlobalActiveMode() {
         bool currentState = lastRelayOutputs[i];
         setRelayOutput(i, currentState);
     }
-    mqttPublishPending = true;
-    mqttPendingRelay = -1;
     server.send(200, "application/json",
         "{\"success\":true,\"mode\":" + String(mode) + "}");
-}
-
-// =============================================================================
-//  MQTT API HANDLERS
-// =============================================================================
-void handleGetMQTT() {
-    DynamicJsonDocument doc(1024);
-    doc["enabled"] = mqttConfig.enabled;
-    doc["connected"] = mqttConnected;
-    doc["broker"] = mqttConfig.broker;
-    doc["port"] = mqttConfig.port;
-    doc["username"] = mqttConfig.username;
-    doc["client_id"] = mqttConfig.client_id;
-    doc["base_topic"] = mqttConfig.base_topic;
-    doc["publish_interval"] = mqttConfig.publish_interval;
-    doc["qos"] = mqttConfig.qos;
-    doc["home_assistant"] = mqttConfig.home_assistant;
-    doc["ha_prefix"] = mqttConfig.ha_prefix;
-    String resp;
-    serializeJson(doc, resp);
-    server.send(200, "application/json", resp);
-}
-
-void handleSaveMQTT() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
-    DynamicJsonDocument doc(1024);
-    DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
-    bool reconnectNeeded = false;
-    if (doc.containsKey("broker")) {
-        const char* b = doc["broker"];
-        if (b) {
-            if (strcmp(mqttConfig.broker, b) != 0) reconnectNeeded = true;
-            strncpy(mqttConfig.broker, b, 63);
-            mqttConfig.broker[63] = '\0';
-        }
-    }
-    if (doc.containsKey("port")) {
-        uint16_t p = doc["port"];
-        if (p > 0 && p <= 65535) {
-            if (p != mqttConfig.port) reconnectNeeded = true;
-            mqttConfig.port = p;
-        }
-    }
-    if (doc.containsKey("username")) {
-        const char* u = doc["username"];
-        if (u) {
-            if (strcmp(mqttConfig.username, u) != 0) reconnectNeeded = true;
-            strncpy(mqttConfig.username, u, 31);
-            mqttConfig.username[31] = '\0';
-        }
-    }
-    if (doc.containsKey("password")) {
-        const char* p = doc["password"];
-        if (p) {
-            if (strcmp(mqttConfig.password, p) != 0) reconnectNeeded = true;
-            strncpy(mqttConfig.password, p, 31);
-            mqttConfig.password[31] = '\0';
-        }
-    }
-    if (doc.containsKey("client_id")) {
-        const char* c = doc["client_id"];
-        if (c && strlen(c) > 0) {
-            if (strcmp(mqttConfig.client_id, c) != 0) reconnectNeeded = true;
-            strncpy(mqttConfig.client_id, c, 31);
-            mqttConfig.client_id[31] = '\0';
-        }
-    }
-    if (doc.containsKey("base_topic")) {
-        const char* t = doc["base_topic"];
-        if (t && strlen(t) > 0) {
-            strncpy(mqttConfig.base_topic, t, 47);
-            mqttConfig.base_topic[47] = '\0';
-        }
-    }
-    if (doc.containsKey("publish_interval")) {
-        uint8_t pi = doc["publish_interval"];
-        if (pi >= 1 && pi <= 60) mqttConfig.publish_interval = pi;
-    }
-    if (doc.containsKey("qos")) {
-        uint8_t q = doc["qos"];
-        mqttConfig.qos = (q <= 1) ? q : 0;
-    }
-    if (doc.containsKey("home_assistant")) {
-        uint8_t ha = doc["home_assistant"];
-        mqttConfig.home_assistant = (ha == 1) ? 1 : 0;
-    }
-    if (doc.containsKey("ha_prefix")) {
-        const char* hp = doc["ha_prefix"];
-        if (hp && strlen(hp) > 0) {
-            strncpy(mqttConfig.ha_prefix, hp, 23);
-            mqttConfig.ha_prefix[23] = '\0';
-        }
-    }
-    saveMQTTConfig();
-    if (reconnectNeeded && mqttConfig.enabled) {
-        mqttDisconnect();
-        lastMQTTReconnect = 0;
-    }
-    server.send(200, "application/json", "{\"success\":true}");
-}
-
-void handleToggleMQTT() {
-    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false,\"error\":\"No data\"}"); return; }
-    StaticJsonDocument<64> doc;
-    DeserializationError err = deserializeJson(doc, server.arg("plain"));
-    if (err) { server.send(400, "application/json", "{\"success\":false,\"error\":\"Bad JSON\"}"); return; }
-    bool enable = doc["enabled"];
-    mqttConfig.enabled = enable ? 1 : 0;
-    saveMQTTConfig();
-    if (!enable) {
-        mqttDisconnect();
-    } else {
-        lastMQTTReconnect = 0;
-    }
-    server.send(200, "application/json",
-        "{\"success\":true,\"enabled\":" + String(enable ? "true" : "false") + "}");
 }
