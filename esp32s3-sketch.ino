@@ -117,6 +117,8 @@ RTC_DS3231 rtc;
 bool rtcPresent = false;
 unsigned long lastRTCDSync = 0;
 bool rtcTimeValid = false;
+static uint8_t rtcFailCount = 0;
+static const uint8_t RTC_FAIL_THRESHOLD = 3;
 static float         cachedRtcTemp          = NAN;
 static unsigned long lastRtcTempRead        = 0;
 static const unsigned long RTC_TEMP_READ_INTERVAL = 10000UL;
@@ -694,6 +696,7 @@ void initRTC() {
     }
     rtcPresent = true;
     rtcTimeValid = false;
+    rtcFailCount = 0;
     if (rtc.lostPower()) {
         return;
     }
@@ -720,6 +723,10 @@ void immediateDS3231Sync() {
             rtc.adjust(dt);
             rtcTimeValid = true;
             lastRTCDSync = millis();
+            rtcFailCount = 0;
+        } else {
+            rtcPresent = false;
+            rtcTimeValid = false;
         }
     }
 }
@@ -736,10 +743,23 @@ float getRTCTemperature() {
     lastRtcTempRead = now;
     Wire.beginTransmission(0x68);
     Wire.write(0x11);
-    if (Wire.endTransmission() != 0) return cachedRtcTemp;
-    if (Wire.requestFrom((uint8_t)0x68, (uint8_t)2) != 2) {
+    if (Wire.endTransmission() != 0) {
+        if (rtcFailCount < 255) rtcFailCount++;
+        if (rtcFailCount >= RTC_FAIL_THRESHOLD) {
+            rtcPresent = false;
+            rtcTimeValid = false;
+        }
         return cachedRtcTemp;
     }
+    if (Wire.requestFrom((uint8_t)0x68, (uint8_t)2) != 2) {
+        if (rtcFailCount < 255) rtcFailCount++;
+        if (rtcFailCount >= RTC_FAIL_THRESHOLD) {
+            rtcPresent = false;
+            rtcTimeValid = false;
+        }
+        return cachedRtcTemp;
+    }
+    rtcFailCount = 0;
     int8_t  msb = (int8_t)Wire.read();
     uint8_t lsb = Wire.read();
     cachedRtcTemp = (float)msb + ((lsb >> 6) * 0.25f);
@@ -921,7 +941,7 @@ bool SelfHealingSystem::liveReconfigureMDNS() {
             MDNS.addServiceTxt("http", "tcp", "model", "ESP32S3");
             MDNS.addServiceTxt("http", "tcp", "version", "v12");
             MDNS.addServiceTxt("http", "tcp", "channels", String(gpioConfig.count).c_str());
-            MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit");
+            MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit,tz");
             mdnsStarted = true;
         }
     } else {
@@ -953,47 +973,50 @@ bool SelfHealingSystem::liveReconfigureAP() {
 }
 
 void SelfHealingSystem::restartAPIfNeeded(bool forceRestart) {
-    if (forceRestart) {
-        WiFi.softAPdisconnect(true);
-        delay(500);
-        uint8_t ch = extConfig.ap_channel;
-        if (ch < 1 || ch > 13) ch = 6;
-        uint8_t hidden = extConfig.ap_hidden ? 1 : 0;
-        if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
-            WiFi.mode(WIFI_AP_STA);
-        }
-        bool apStarted = false;
+    if (!forceRestart) return;
+    WiFi.softAPdisconnect(true);
+    delay(500);
+    uint8_t ch = extConfig.ap_channel;
+    if (ch < 1 || ch > 13) ch = 6;
+    uint8_t hidden = extConfig.ap_hidden ? 1 : 0;
+    if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
+        WiFi.mode(WIFI_AP_STA);
+    }
+    bool apStarted = false;
+    if (strlen(sysConfig.ap_password) > 0) {
+        apStarted = WiFi.softAP(sysConfig.ap_ssid, sysConfig.ap_password, ch, hidden);
+    } else {
+        apStarted = WiFi.softAP(sysConfig.ap_ssid, NULL, ch, hidden);
+    }
+    if (!apStarted) {
         if (strlen(sysConfig.ap_password) > 0) {
-            apStarted = WiFi.softAP(sysConfig.ap_ssid, sysConfig.ap_password, ch, hidden);
+            apStarted = WiFi.softAP(sysConfig.ap_ssid, sysConfig.ap_password, 6, hidden);
         } else {
-            apStarted = WiFi.softAP(sysConfig.ap_ssid, NULL, ch, hidden);
+            apStarted = WiFi.softAP(sysConfig.ap_ssid, NULL, 6, hidden);
         }
-        if (apStarted) {
-            delay(100);
-            dnsServer.stop();
-            dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-            if (mdnsStarted) {
-                MDNS.end();
-                mdnsStarted = false;
-            }
-            lastMDNSReconfigure = millis() - 60000UL;
-            liveReconfigureMDNS();
+    }
+    if (apStarted) {
+        delay(100);
+        dnsServer.stop();
+        dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+        if (mdnsStarted) {
+            MDNS.end();
+            mdnsStarted = false;
+        }
+        delay(50);  
+        if (MDNS.begin(mdnsHostname)) {
+            MDNS.addService("http", "tcp", 80);
+            MDNS.addServiceTxt("http", "tcp", "model", "ESP32S3");
+            MDNS.addServiceTxt("http", "tcp", "version", "v12");
+            MDNS.addServiceTxt("http", "tcp", "channels", String(gpioConfig.count).c_str());
+            MDNS.addServiceTxt("http", "tcp", "features", "monthmask,64bit,tz");
+            mdnsStarted = true;
         } else {
-            if (strlen(sysConfig.ap_password) > 0) {
-                WiFi.softAP(sysConfig.ap_ssid, sysConfig.ap_password, 6, hidden);
-            } else {
-                WiFi.softAP(sysConfig.ap_ssid, NULL, 6, hidden);
-            }
-            delay(100);
-            dnsServer.stop();
-            dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-            if (mdnsStarted) {
-                MDNS.end();
-                mdnsStarted = false;
-            }
-            lastMDNSReconfigure = millis() - 60000UL;
-            liveReconfigureMDNS();
+            mdnsStarted = false;
         }
+        lastMDNSReconfigure = millis();
+    } else {
+        ESP.restart();
     }
 }
 
@@ -1004,7 +1027,11 @@ bool SelfHealingSystem::recoverRTC() {
     if (!rtcPresent) return false;
     Wire.begin(8, 9);
     Wire.setTimeOut(50);
-    if (!rtc.begin()) return false;
+    if (!rtc.begin()) {
+        rtcPresent = false;
+        rtcTimeValid = false;
+        return false;
+    }
     if (rtcInitialized && internalEpoch > 0) {
         DateTime dt = uint64ToRtcDateTime(internalEpoch);
         rtc.adjust(dt);
@@ -1154,7 +1181,7 @@ main{max-width:1200px;margin:0 auto;padding:16px}
 .ctitle{font-weight:700;font-size:15px;cursor:pointer;transition:background .15s;padding:2px 4px;border-radius:4px}
 .ctitle:hover{background:#E3F2FD;color:#1565C0}
 .badge{padding:3px 9px;border-radius:20px;font-size:11px;font-weight:700}
-.bon{background:#E8F5E9;color:#2E7D32}.boff{background:#FFEBEE;color:#C62828}.bman{background:#FFF3E0;color:#E65100}
+.bon{background:#E8F5E9;color:#2E7D32}.boff{background:#FFEBEE;color:#C62828}.bman{background:#FFF3E0;color:#E65100}.bman-on{background:#FFF3E0;color:#E65100;border:1px solid #FFB74D}.bman-off{background:#FBE9E7;color:#BF360C;border:1px solid #FF8A65}
 .brow{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
 .btn{border:none;padding:7px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;transition:.15s}
 .btn:hover{filter:brightness(1.1)}.btn:disabled{opacity:.5;cursor:default}
@@ -1285,9 +1312,14 @@ function tick(){
     if(w)w.className='dot '+(d.wifi?'g':'r');
     if(t){
       let tc='y';
-      if(d.timeSource==='ntp')tc='g';
-      else if(d.timeSource==='browser')tc='y';
-      else if(d.timeSource==='rtc')tc='g';
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+      if(auth==='ntp'){
+        tc = (d.authorityStale === true) ? 'y' : 'g';
+      }
+      else if(auth==='browser')tc='y';
+      else if(auth==='ds3231')tc='g';
+      else if(auth==='internal_rtc')tc='y';
+      else if(auth==='rtc')tc=(d.rtcPresent === true) ? 'g' : 'y';
       else tc='y';
       t.className='dot '+tc;
     }
@@ -1362,9 +1394,6 @@ function load(){
   if(loadInFlight) return;
   loadInFlight = true;
   const g = document.getElementById('grid');
-  if(g && (!Array.isArray(relays) || relays.length === 0)) {
-    g.innerHTML = '<div class="card" style="text-align:center;padding:40px"><p style="color:#90A4AE">&#x23F3; Loading relays...</p></div>';
-  }
   fetchWithTimeout('/api/relays').then(r=>r.json()).then(d=>{
     loadInFlight = false;
     if(!Array.isArray(d)){toast('Load error',false);if(g && (!Array.isArray(relays) || relays.length === 0))g.innerHTML='';return;}
@@ -1568,8 +1597,8 @@ function render(){
       r = {state:false, manual:false, name:'Relay '+(i+1), schedules:[]};
       relays[i] = r;
     }
-    const sl = r.manual ? 'MANUAL' : r.state ? 'ON' : 'OFF';
-    const sc = r.manual ? 'bman' : r.state ? 'bon' : 'boff';
+    const sl = r.manual ? (r.state ? 'MANUAL ON' : 'MANUAL OFF') : (r.state ? 'ON' : 'OFF');
+    const sc = r.manual ? (r.state ? 'bman-on' : 'bman-off') : (r.state ? 'bon' : 'boff');
     const displayName = r.name || ('Relay '+(i+1));
     let html = `<div class="card">
 <div class="card-hdr">
@@ -1858,16 +1887,66 @@ const char wifi_html[] PROGMEM = R"raw(<!DOCTYPE html>
 }
 </style>
 <script>
-function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
+function toast(m,ok=true){
+  const t = document.getElementById('toast');
+  if(!t) return;
+  t.textContent = (typeof m === 'string') ? m : String(m == null ? '' : m);
+  t.className = 'show ' + (ok ? 'ok' : 'er');
+  clearTimeout(t._t);
+  t._t = setTimeout(()=>{ t.className = ''; }, 3000);
+}
 
-function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status); return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+function fetchWithTimeout(url, options, timeout){
+  options = options || {};
+  timeout = timeout || 10000;
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), timeout);
+  const opts = Object.assign({}, options, {signal: controller.signal});
+  return fetch(url, opts).then(
+    r => { clearTimeout(timer); return r; },
+    e => { clearTimeout(timer); throw e; }
+  );
+}
+
+function tick(){
+  if(tick._inflight) return;
+  tick._inflight = true;
+  fetchWithTimeout('/api/time', {}, 8000).then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(d=>{
+    tick._inflight = false;
+    if(!d || typeof d !== 'object' || Array.isArray(d)) return;
+    const clkEl = document.getElementById('clk');
+    if(clkEl) clkEl.textContent = d.time || '--:--:--';
+    const de = document.getElementById('date');
+    if(de) de.textContent = (d.weekday ? d.weekday + ' ' : '') + (d.date || '--/--/----');
+    const w = document.querySelector('.wd');
+    const t = document.querySelector('.td');
+    if(w) w.className = 'dot ' + (d.wifi ? 'g' : 'r');
+    if(t){
+      let tc = 'y';
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+      if(auth === 'ntp'){
+        tc = (d.authorityStale === true) ? 'y' : 'g';
+      }
+      else if(auth === 'browser') tc = 'y';
+      else if(auth === 'ds3231') tc = 'g';
+      else if(auth === 'internal_rtc') tc = 'y';
+      else if(auth === 'rtc') tc = (d.rtcPresent === true) ? 'g' : 'y';
+      else tc = 'y';
+      t.className = 'dot ' + tc;
+    }
+  }).catch(()=>{ tick._inflight = false; });
+}
 setInterval(tick,1000);tick();
 
 function updateStaButton(enabled) {
     const btn = document.getElementById('staToggleBtn');
     if(!btn) return;
-    btn.dataset.enabled = enabled ? 'true' : 'false';
-    if(enabled) {
+    const on = !!enabled;
+    btn.dataset.enabled = on ? 'true' : 'false';
+    if(on) {
         btn.textContent = '✓ ON';
         btn.className = 'btn btn-sta-on';
     } else {
@@ -1879,14 +1958,18 @@ function updateStaButton(enabled) {
 
 function isStaEnabled() {
     const btn = document.getElementById('staToggleBtn');
-    return !!(btn && btn.dataset.enabled === 'true');
+    return !!(btn && btn.dataset && btn.dataset.enabled === 'true');
 }
 
 function loadWiFiStatus() {
-    fetch('/api/wifi').then(r=>{
+    if(loadWiFiStatus._inflight) return;
+    loadWiFiStatus._inflight = true;
+    fetchWithTimeout('/api/wifi', {}, 8000).then(r=>{
         if(!r.ok) throw new Error('HTTP '+r.status);
         return r.json();
     }).then(d=>{
+        loadWiFiStatus._inflight = false;
+        if(!d || typeof d !== 'object' || Array.isArray(d)) return;
         const ssidEl = document.getElementById('ssid');
         const active = document.activeElement;
         const serverSSID = d.ssid || '';
@@ -1902,13 +1985,14 @@ function loadWiFiStatus() {
             const inputs = stationDiv.querySelectorAll('input, button');
             inputs.forEach(inp => inp.disabled = !staEnabled);
         }
-        const s=document.getElementById('status');
-        s.style.display='';
-        s.textContent='';
+        const s = document.getElementById('status');
+        if(!s) return;
+        s.style.display = '';
+        s.textContent = '';
         if(staEnabled && d.connected){
             const span1 = document.createElement('span');
-            span1.style.fontWeight='700';
-            span1.textContent='✓ Connected';
+            span1.style.fontWeight = '700';
+            span1.textContent = '✓ Connected';
             s.appendChild(span1);
             s.appendChild(document.createTextNode(' to: '));
             const strong = document.createElement('strong');
@@ -1919,33 +2003,47 @@ function loadWiFiStatus() {
             bars.innerHTML = rssiBar(d.rssi||0);
             s.appendChild(bars);
             s.appendChild(document.createTextNode(' '+(d.rssi||0)+'dBm'));
-            s.className='alert ai';
+            s.className = 'alert ai';
         } else if(staEnabled && !d.connected) {
             const b1 = document.createElement('span');
-            b1.style.fontWeight='700';
-            b1.textContent='⚠ Not Connected';
+            b1.style.fontWeight = '700';
+            b1.textContent = '⚠ Not Connected';
             s.appendChild(b1);
             s.appendChild(document.createElement('br'));
             s.appendChild(document.createTextNode('Configure SSID/password above to connect to a WiFi network.'));
-            s.className='alert aw';
+            s.className = 'alert aw';
         } else {
             const b1 = document.createElement('span');
-            b1.style.fontWeight='700';
-            b1.textContent='⛔ WiFi Station Disabled';
+            b1.style.fontWeight = '700';
+            b1.textContent = '⛔ WiFi Station Disabled';
             s.appendChild(b1);
             s.appendChild(document.createElement('br'));
             s.appendChild(document.createTextNode('ESP32S3 running in AP-only mode. Enable above to connect to WiFi networks for NTP time sync.'));
-            s.className='alert aw';
+            s.className = 'alert aw';
         }
     }).catch(()=>{
+        loadWiFiStatus._inflight = false;
+        const s = document.getElementById('status');
+        if(s){
+            s.style.display = '';
+            s.textContent = '';
+            const b1 = document.createElement('span');
+            b1.style.fontWeight = '700';
+            b1.textContent = '⚠ Could not refresh WiFi status';
+            s.appendChild(b1);
+            s.className = 'alert aw';
+        }
     });
 }
 
 function rssiBar(rssi){
-    const b=rssi>=-50?4:rssi>=-60?3:rssi>=-70?2:1;
-    let s='<span class="bars">';
-    for(let i=1;i<=4;i++)s+='<span class="bar'+(i<=b?' on':'')+('" style="height:'+(i*3+2)+'px"></span>');
-    return s+'</span>';
+    const r = (typeof rssi === 'number' && isFinite(rssi)) ? rssi : -100;
+    const b = r >= -50 ? 4 : r >= -60 ? 3 : r >= -70 ? 2 : 1;
+    let s = '<span class="bars">';
+    for(let i = 1; i <= 4; i++){
+        s += '<span class="bar' + (i <= b ? ' on' : '') + '" style="height:' + (i*3+2) + 'px"></span>';
+    }
+    return s + '</span>';
 }
 
 function toggleStation() {
@@ -1955,20 +2053,26 @@ function toggleStation() {
     const willEnable = !wasEnabled;
     btn.disabled = true;
     btn.textContent = '...';
-    fetch('/api/wifi', {
+    fetchWithTimeout('/api/wifi', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({sta_enabled: willEnable})
-    }).then(r=>{
+    }, 10000).then(r=>{
         if(!r.ok) throw new Error('HTTP '+r.status);
         return r.json();
     }).then(d=>{
         btn.disabled = false;
+        if(!d || typeof d !== 'object' || Array.isArray(d)){
+            toast('Failed to toggle WiFi station', false);
+            updateStaButton(wasEnabled);
+            return;
+        }
         if(d.success) {
             updateStaButton(willEnable);
             if(!willEnable) {
                 window._staDisabled = true;
                 if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
+                if(pollScan){ pollScan._inflight = false; }
                 if(scanning) endScan();
                 const nlReset = document.getElementById('netlist');
                 if(nlReset){ nlReset.innerHTML=''; nlReset.style.display='none'; }
@@ -2005,32 +2109,43 @@ function startScan(){
     window._staDisabled = false;
     if(scanning)return;
     scanning=true;
-    document.getElementById('scanBtn').textContent='\u23F3 Scanning\u2026';
-    document.getElementById('scanBtn').disabled=true;
-    const nl=document.getElementById('netlist');
-    nl.style.display='block';
-    nl.innerHTML='<div style="text-align:center;color:#90A4AE;padding:12px;font-size:13px">📡 Scanning for networks...</div>';
-    fetch('/api/wifi/scan',{method:'POST'})
+    const scanBtn = document.getElementById('scanBtn');
+    if(scanBtn){
+        scanBtn.textContent = '\u23F3 Scanning\u2026';
+        scanBtn.disabled = true;
+    }
+    const nl = document.getElementById('netlist');
+    if(nl){
+        nl.style.display = 'block';
+        nl.innerHTML = '<div style="text-align:center;color:#90A4AE;padding:12px;font-size:13px">📡 Scanning for networks...</div>';
+    }
+    fetchWithTimeout('/api/wifi/scan', {method:'POST'}, 10000)
     .then(r => {
         if(!r.ok) throw new Error('HTTP '+r.status);
         return r.json();
     })
-    .then(()=>{ 
-        scanTimer=setInterval(pollScan,2500); 
+    .then(()=>{
+        if(scanTimer){ clearInterval(scanTimer); scanTimer = null; }
+        pollScan._inflight = false;
+        scanTimer = setInterval(pollScan, 2500);
     })
     .catch(()=>{
         endScan();
         toast('Scan failed \u2014 enable WiFi Station', false);
-        const nl2=document.getElementById('netlist');
-        if(nl2){ nl2.innerHTML=''; nl2.style.display='none'; }
+        const nl2 = document.getElementById('netlist');
+        if(nl2){ nl2.innerHTML = ''; nl2.style.display = 'none'; }
     });
 }
 function pollScan(){
-    fetch('/api/wifi/scan').then(r=>{
+    if(pollScan._inflight) return;
+    pollScan._inflight = true;
+    fetchWithTimeout('/api/wifi/scan', {}, 10000).then(r=>{
         if(!r.ok) throw new Error('HTTP '+r.status);
         return r.json();
     }).then(d=>{
+        pollScan._inflight = false;
         if(window._staDisabled){ return; }
+        if(!d || typeof d !== 'object' || Array.isArray(d)) return;
         if(!d.scanning){
             if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
             endScan();
@@ -2038,20 +2153,25 @@ function pollScan(){
             renderNets(nets);
         }
     }).catch(()=>{
+        pollScan._inflight = false;
         if(scanTimer){ clearInterval(scanTimer); scanTimer=null; }
         endScan();
         toast('Scan poll failed', false);
     });
 }
 function endScan(){
-    scanning=false;
-    document.getElementById('scanBtn').textContent='\uD83D\uDCF6 Scan';
-    document.getElementById('scanBtn').disabled=false;
+    scanning = false;
+    const btn = document.getElementById('scanBtn');
+    if(btn){
+        btn.textContent = '\uD83D\uDCF6 Scan';
+        btn.disabled = false;
+    }
 }
 function renderNets(nets){
-    const nl=document.getElementById('netlist');
-    if(!Array.isArray(nets) || nets.length===0){
-        nl.innerHTML='<div style="color:#90A4AE;text-align:center;padding:8px;font-size:13px">No networks found. Make sure WiFi is enabled.</div>';
+    const nl = document.getElementById('netlist');
+    if(!nl) return;
+    if(!Array.isArray(nets) || nets.length === 0){
+        nl.innerHTML = '<div style="color:#90A4AE;text-align:center;padding:8px;font-size:13px">No networks found. Make sure WiFi is enabled.</div>';
         return;
     }
     const frag=document.createDocumentFragment();
@@ -2081,33 +2201,43 @@ function saveWiFi(){
         return;
     }
     const ssidEl = document.getElementById('ssid');
-    const ssid=ssidEl.value.trim();
-    if(!ssid){toast('SSID required',false);return;}
+    if(!ssidEl){ toast('SSID field not found', false); return; }
+    const ssid = ssidEl.value.trim();
+    if(!ssid){ toast('SSID required', false); return; }
     try {
-        if(new TextEncoder().encode(ssid).length > 31){toast('SSID must be 31 bytes or less',false);return;}
+        if(new TextEncoder().encode(ssid).length > 31){ toast('SSID must be 31 bytes or less', false); return; }
     } catch(e) {
-        if(ssid.length > 31){toast('SSID must be 31 characters or less',false);return;}
+        if(ssid.length > 31){ toast('SSID must be 31 characters or less', false); return; }
     }
     const btn = document.querySelector('.bsave');
     if(!btn || btn.disabled) return;
     btn.disabled = true;
     btn.textContent = 'Saving...';
     const body = {ssid: ssid};
-    const pwVal = document.getElementById('pw').value;
+    const pwEl = document.getElementById('pw');
+    const pwVal = pwEl ? pwEl.value : '';
     if (pwVal.length > 0) body.password = pwVal;
     const lastKnownSSID = (typeof window._lastSSID === 'string') ? window._lastSSID : '';
     const ssidChanged = (ssid !== lastKnownSSID);
-    fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    fetchWithTimeout('/api/wifi', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(body)
+    }, 15000)
     .then(r=>{
-        if(!r.ok) return r.json().then(e=>Promise.reject(e));
+        if(!r.ok) return r.json().catch(()=>({error:'HTTP '+r.status})).then(e=>Promise.reject(e));
         return r.json();
     }).then(d=>{
         btn.disabled = false;
         btn.innerHTML = '&#x1F4BE; Save &amp; Connect';
+        if(!d || typeof d !== 'object' || Array.isArray(d)){
+            toast('Error: invalid response', false);
+            return;
+        }
         if(d.success){
             if(ssidChanged){
                 toast('Credentials saved! Reconnecting...');
-                setTimeout(()=>window.location.href='/',3000);
+                setTimeout(()=>{ window.location.href='/'; }, 3000);
             } else {
                 toast('Settings saved.');
             }
@@ -2177,20 +2307,39 @@ function toast(m,ok=true){const t=document.getElementById('toast');t.textContent
 let lastNtpSyncAge = -1;
 function fmtOff(s){const h=Math.floor(Math.abs(s)/3600);const m=Math.floor((Math.abs(s)%3600)/60);return (s<0?'-':'+')+h+(m?':'+String(m).padStart(2,'0'):'');}
 function tick(){
-  fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}if(typeof d.ntpSyncAge === 'number' && d.ntpSyncAge !== 4294967295 && d.ntpSyncAge >= 0)lastNtpSyncAge=d.ntpSyncAge;updateTimeStatus(d);}).catch(()=>{});}
+  fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';const auth=(typeof d.authority==='string'&&d.authority)?d.authority:d.timeSource;if(auth==='ntp'){tc=(d.authorityStale===true)?'y':'g';}else if(auth==='browser')tc='y';else if(auth==='ds3231')tc='g';else if(auth==='internal_rtc')tc='y';else if(auth==='rtc')tc=(d.rtcPresent===true)?'g':'y';else tc='y';t.className='dot '+tc;}if(typeof d.ntpSyncAge === 'number' && d.ntpSyncAge !== 4294967295 && d.ntpSyncAge >= 0)lastNtpSyncAge=d.ntpSyncAge;updateTimeStatus(d);}).catch(()=>{});}
 function updateTimeStatus(d){
   const s=document.getElementById('timeStatus');
   s.style.display='block';
   let icon='',msg='',cls='ai';
-  if(d.timeSource==='ntp'){
-    icon='&#x2705;';msg='Time source: <strong>NTP Server</strong> — High Accuracy';
-    cls='ai';
-  }else if(d.timeSource==='browser'){
+  const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+  const isStale = (d.authorityStale === true);
+  if(auth==='ntp'){
+    if(isStale){
+      icon='&#x26A0;&#xFE0F;';
+      msg='Time source: <strong>NTP Server</strong> — Stale, awaiting resync';
+      cls='aw';
+    }else{
+      icon='&#x2705;';msg='Time source: <strong>NTP Server</strong> — High Accuracy';
+      cls='ai';
+    }
+  }else if(auth==='browser'){
     icon='&#x1F310;';msg='Time source: <strong>Browser Sync</strong> — Moderate Accuracy';
     cls='aw';
-  }else if(d.timeSource==='rtc'){
+  }else if(auth==='ds3231'){
     icon='&#x1F4BF;';msg='Time source: <strong>DS3231 Real Time Clock</strong> — High Accuracy';
     cls='ai';
+  }else if(auth==='internal_rtc'){
+    icon='&#x1F4BF;';msg='Time source: <strong>Internal RTC (NVS)</strong> — Moderate Accuracy';
+    cls='aw';
+  }else if(auth==='rtc'){
+    if(d.rtcPresent){
+      icon='&#x1F4BF;';msg='Time source: <strong>DS3231 Real Time Clock</strong> — High Accuracy';
+      cls='ai';
+    }else{
+      icon='&#x1F4BF;';msg='Time source: <strong>Internal RTC (NVS)</strong> — Moderate Accuracy';
+      cls='aw';
+    }
   }else{
     icon='&#x26A0;&#xFE0F;';msg='Time source: <strong>None</strong> — Please sync time';
     cls='aw';
@@ -2454,25 +2603,89 @@ const char ap_html[] PROGMEM = R"raw(<!DOCTYPE html>
 </main>
 <div id="toast"></div>
 <script>
-function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
+function toast(m,ok=true){
+  const t=document.getElementById('toast');
+  if(!t) return;
+  t.textContent = (typeof m === 'string') ? m : String(m == null ? '' : m);
+  t.className='show '+(ok?'ok':'er');
+  clearTimeout(t._t);
+  t._t=setTimeout(()=>t.className='',3000);
+}
 function escapeHtml(text){const d=document.createElement('div');d.textContent=String(text==null?'':text);return d.innerHTML;}
+
+function fetchWithTimeout(url, options, timeout){
+  options = options || {};
+  timeout = timeout || 10000;
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), timeout);
+  const opts = Object.assign({}, options, {signal: controller.signal});
+  return fetch(url, opts).then(
+    r => { clearTimeout(timer); return r; },
+    e => { clearTimeout(timer); throw e; }
+  );
+}
+
 let savingAP = false;
-function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
-setInterval(tick,1000);tick();
-fetch('/api/ap').then(r=>r.json()).then(d=>{
-  document.getElementById('ssid').value=d.ap_ssid||'';
-  document.getElementById('ch').value=d.ap_channel||6;
-  document.getElementById('hidden').value=d.ap_hidden?'1':'0';
+let tickIntervalId = null;
+
+function tick(){
+  if(tick._inflight) return;
+  tick._inflight = true;
+  fetchWithTimeout('/api/time', {}, 8000).then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(d=>{
+    tick._inflight = false;
+    if(!d || typeof d !== 'object' || Array.isArray(d)) return;
+    const clkEl = document.getElementById('clk');
+    if(clkEl) clkEl.textContent = d.time || '--:--:--';
+    const de = document.getElementById('date');
+    if(de) de.textContent = (d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');
+    const w = document.querySelector('.wd'), t = document.querySelector('.td');
+    if(w) w.className='dot '+(d.wifi?'g':'r');
+    if(t){
+      let tc='y';
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+      if(auth==='ntp'){
+        tc = (d.authorityStale === true) ? 'y' : 'g';
+      }
+      else if(auth==='browser')tc='y';
+      else if(auth==='ds3231')tc='g';
+      else if(auth==='internal_rtc')tc='y';
+      else if(auth==='rtc')tc=(d.rtcPresent === true) ? 'g' : 'y';
+      else tc='y';
+      t.className='dot '+tc;
+    }
+  }).catch(()=>{ tick._inflight = false; });
+}
+tickIntervalId = setInterval(tick,1000);
+tick();
+
+fetchWithTimeout('/api/ap', {}, 8000).then(r=>{
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return r.json();
+}).then(d=>{
+  if(!d || typeof d !== 'object' || Array.isArray(d)) return;
+  const ssidEl = document.getElementById('ssid');
+  if(ssidEl) ssidEl.value = d.ap_ssid || '';
+  const chEl = document.getElementById('ch');
+  if(chEl) chEl.value = d.ap_channel || 6;
+  const hiddenEl = document.getElementById('hidden');
+  if(hiddenEl) hiddenEl.value = d.ap_hidden ? '1' : '0';
   const pwEl = document.getElementById('pw');
   const clearEl = document.getElementById('clearPw');
   if(pwEl) pwEl.addEventListener('input', function(){ if(this.value.length > 0 && clearEl) clearEl.checked = false; });
   if(clearEl) clearEl.addEventListener('change', function(){ if(this.checked && pwEl) pwEl.value = ''; });
-}).catch(()=>{});
+}).catch(()=>{
+  toast('Could not load AP settings \u2014 check connection', false);
+});
+
 function save(){
   if(savingAP) return;
   const btn = document.getElementById('apSaveBtn') || document.querySelector('.bsave');
 
   const ssidEl = document.getElementById('ssid');
+  if(!ssidEl){ toast('SSID field not found', false); return; }
   const ssid = (ssidEl.value || '').trim();
   if(!ssid){ toast('SSID cannot be empty', false); return; }
   if(ssid.length > 31){ toast('SSID must be 31 characters or less', false); return; }
@@ -2481,16 +2694,19 @@ function save(){
   } catch(e) {}
 
   const pwEl = document.getElementById('pw');
-  const pw = pwEl.value || '';
+  const pw = pwEl ? (pwEl.value || '') : '';
   const clearPwEl = document.getElementById('clearPw');
   const shouldClear = !!(clearPwEl && clearPwEl.checked);
+
+  let pwBytes = pw.length;
+  try { pwBytes = new TextEncoder().encode(pw).length; } catch(e) {}
 
   if(!shouldClear && pw.length > 0 && pw.length < 8){
     toast('Password must be 8+ characters or blank', false);
     return;
   }
-  if(pw.length > 31){
-    toast('Password must be 31 characters or less', false);
+  if(pwBytes > 31){
+    toast('Password must be 31 bytes or less', false);
     return;
   }
   if(shouldClear && pw.length > 0){
@@ -2498,10 +2714,12 @@ function save(){
     return;
   }
 
+  const chEl = document.getElementById('ch');
+  const hiddenEl = document.getElementById('hidden');
   const body = {
     ap_ssid: ssid,
-    ap_channel: parseInt(document.getElementById('ch').value) || 6,
-    ap_hidden: document.getElementById('hidden').value === '1'
+    ap_channel: chEl ? (parseInt(chEl.value) || 6) : 6,
+    ap_hidden: hiddenEl ? (hiddenEl.value === '1') : false
   };
 
   if(shouldClear){
@@ -2547,6 +2765,7 @@ function save(){
     }
     if(d.success){
       if(d.restarted){
+        if(tickIntervalId !== null){ clearInterval(tickIntervalId); tickIntervalId = null; }
         toast('AP restarted \u2014 reconnect to new network', false);
         document.body.innerHTML = '<div style="text-align:center;padding:60px 20px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#EEF2F7;min-height:100vh;box-sizing:border-box">'
           + '<div style="background:#fff;max-width:420px;margin:0 auto;border-radius:12px;padding:32px 24px;box-shadow:0 4px 20px rgba(0,0,0,.1)">'
@@ -2569,7 +2788,18 @@ function save(){
   .catch((e) => {
     if(timeoutId !== undefined) clearTimeout(timeoutId);
     savingAP = false;
-    toast('Error: ' + ((e && e.error) || 'request failed'), false);
+    if(e && e.name === 'AbortError'){
+      toast('Request timed out \u2014 AP may have restarted. Check your network.', false);
+    } else if(e && (e.error || e.message)){
+      const msg = e.error || e.message || 'request failed';
+      if(typeof msg === 'string' && (msg.indexOf('Failed to fetch') >= 0 || msg.indexOf('NetworkError') >= 0)){
+        toast('Network error \u2014 AP may have restarted. Check your network.', false);
+      } else {
+        toast('Error: ' + msg, false);
+      }
+    } else {
+      toast('Error: request failed \u2014 AP may have restarted.', false);
+    }
     if(btn){ btn.disabled = false; btn.innerHTML = '&#x1F4BE; Save Settings'; }
   });
 }
@@ -2637,7 +2867,7 @@ const char gpio_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div id="toast"></div>
 <script>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
-function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';if(d.timeSource==='ntp')tc='g';else if(d.timeSource==='browser')tc='y';else if(d.timeSource==='rtc')tc='g';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
+function tick(){fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{document.getElementById('clk').textContent=d.time||'--:--:--';const de=document.getElementById('date');if(de)de.textContent=(d.weekday?d.weekday+' ':'')+(d.date||'--/--/----');const w=document.querySelector('.wd'),t=document.querySelector('.td');if(w)w.className='dot '+(d.wifi?'g':'r');if(t){let tc='y';const auth=(typeof d.authority==='string'&&d.authority)?d.authority:d.timeSource;if(auth==='ntp'){tc=(d.authorityStale===true)?'y':'g';}else if(auth==='browser')tc='y';else if(auth==='ds3231')tc='g';else if(auth==='internal_rtc')tc='y';else if(auth==='rtc')tc=(d.rtcPresent===true)?'g':'y';else tc='y';t.className='dot '+tc;}}).catch(()=>{});}
 setInterval(tick,1000);tick();
 // change gpio
 const DEFAULT_PINS = [4,5,6,7,11,12,13,14,1,2,42,41,47,21,20,19];
@@ -2792,6 +3022,9 @@ function resetDefaults() {
 loadGPIO();
 </script></body></html>)raw";
 
+// =============================================================================
+//  SYSTEM PAGE
+// =============================================================================
 const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>System</title>
@@ -2815,13 +3048,14 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div class="ibox"><div class="l">Free Heap</div><div class="v" id="shp">&hellip;</div></div>
 <div class="ibox"><div class="l">Uptime</div><div class="v" id="sup">&hellip;</div></div>
 <div class="ibox"><div class="l">WiFi RSSI</div><div class="v" id="srs">&hellip;</div></div>
-<div class="ibox"><div class="l">Time Source</div><div class="v" id="stsrc" style="font-size:13px">&hellip;</div></div>
-<div class="ibox"><div class="l">Timezone</div><div class="v" id="stz" style="font-size:13px">&hellip;</div></div>
+<div class="ibox"><div class="l">Last Sync Source</div><div class="v" id="stsrc" style="font-size:13px">&hellip;</div></div>
+<div class="ibox"><div class="l">Current Authority</div><div class="v" id="sauth" style="font-size:13px">&hellip;</div></div>
+<div class="ibox"><div class="l">Timezone</div><div class="v" id="stz" style="font-size:13px;word-break:break-word">&hellip;</div></div>
 <div class="ibox"><div class="l">DST Status</div><div class="v" id="sdst" style="font-size:13px">&hellip;</div></div>
 <div class="ibox"><div class="l">UTC Epoch</div><div class="v" id="sutc" style="font-size:11px">&hellip;</div></div>
 <div class="ibox"><div class="l">NTP Last Sync</div><div class="v" id="snt">&hellip;</div></div>
 <div class="ibox"><div class="l">Last Browser Sync</div><div class="v" id="sbs">&hellip;</div></div>
-<div class="ibox"><div class="l">NTP Server</div><div class="v" id="sns" style="font-size:12px">&hellip;</div></div>
+<div class="ibox"><div class="l">NTP Server</div><div class="v" id="sns" style="font-size:12px;word-break:break-all">&hellip;</div></div>
 <div class="ibox"><div class="l">Chip Model</div><div class="v" id="sch">&hellip;</div></div>
 <div class="ibox"><div class="l">mDNS Hostname</div><div class="v" id="smdns">&hellip;</div></div>
 <div class="ibox"><div class="l">Relay Count</div><div class="v" id="src">&hellip;</div></div>
@@ -2831,7 +3065,7 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 <div class="ibox"><div class="l">DS3231 RTC</div><div class="v" id="srtc">&hellip;</div></div>
 <div class="ibox"><div class="l">DS3231 Last Sync</div><div class="v" id="srtcsync">&hellip;</div></div>
 <div class="ibox"><div class="l">DS3231 Temp</div><div class="v" id="srtctemp">&hellip;</div></div>
-<div class="ibox"><div class="l">Sync Direction</div><div class="v" id="ssyncdir" style="font-size:12px;color:#7B1FA2">&hellip;</div></div>
+<div class="ibox"><div class="l">Sync Direction</div><div class="v" id="ssyncdir" style="font-size:12px;color:#7B1FA2;word-break:break-word">&hellip;</div></div>
 <div class="ibox"><div class="l">WiFi Station</div><div class="v" id="stawifi">&hellip;</div></div>
 </div>
 
@@ -2849,7 +3083,13 @@ const char system_html[] PROGMEM = R"raw(<!DOCTYPE html>
 function toast(m,ok=true){const t=document.getElementById('toast');t.textContent=m;t.className='show '+(ok?'ok':'er');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3000);}
 
 function tick(){
-  fetch('/api/time').then(r=>{if(!r.ok) throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
+  if(tick._inflight) return;
+  tick._inflight = true;
+  fetch('/api/time').then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(d=>{
+    tick._inflight = false;
     if(!d || typeof d !== 'object') return;
     const clkEl = document.getElementById('clk');
     if(clkEl) clkEl.textContent = (typeof d.time === 'string' && d.time) ? d.time : '--:--:--';
@@ -2864,15 +3104,18 @@ function tick(){
     if(w) w.className = 'dot ' + (d.wifi ? 'g' : 'r');
     if(t){
       let tc = 'y';
-      if(d.timeSource === 'ntp') tc = 'g';
-      else if(d.timeSource === 'browser') tc = 'y';
-      else if(d.timeSource === 'rtc') tc = 'g';
-      else if(d.timeSource === 'ds3231') tc = 'g';
-      else if(d.timeSource === 'internal rtc') tc = 'g';
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : d.timeSource;
+      if(auth === 'ntp'){
+        tc = (d.authorityStale === true) ? 'y' : 'g';
+      }
+      else if(auth === 'browser') tc = 'y';
+      else if(auth === 'ds3231') tc = 'g';
+      else if(auth === 'internal_rtc') tc = 'y';
+      else if(auth === 'rtc') tc = (d.rtcPresent === true) ? 'g' : 'y';
       else tc = 'y';
       t.className = 'dot ' + tc;
     }
-  }).catch(()=>{});
+  }).catch(()=>{ tick._inflight = false; });
 }
 setInterval(tick,1000);tick();
 
@@ -2923,17 +3166,20 @@ function safeAge(v){
 }
 
 function loadSys(){
+  if(loadSys._inflight) return;
+  loadSys._inflight = true;
   fetch('/api/system').then(r=>{
     if(!r.ok) throw new Error('HTTP '+r.status);
     return r.json();
   }).then(d=>{
+    loadSys._inflight = false;
     if(!d || typeof d !== 'object' || Array.isArray(d) || Object.keys(d).length === 0) return;
 
     const sipEl = document.getElementById('sip');
-    if(sipEl) sipEl.textContent = (d.wifiConnected && typeof d.ip === 'string' && d.ip) ? d.ip : '(not connected)';
+    if(sipEl) sipEl.textContent = (d.wifiConnected && typeof d.ip === 'string' && d.ip && d.ip !== '0.0.0.0') ? d.ip : '(not connected)';
 
     const sapEl = document.getElementById('sap');
-    if(sapEl) sapEl.textContent = (typeof d.ap_ip === 'string' && d.ap_ip) ? d.ap_ip : '\u2014';
+    if(sapEl) sapEl.textContent = (typeof d.ap_ip === 'string' && d.ap_ip && d.ap_ip !== '0.0.0.0') ? d.ap_ip : '\u2014';
 
     const shpEl = document.getElementById('shp');
     if(shpEl){
@@ -2959,6 +3205,31 @@ function loadSys(){
       tsrcEl.textContent = tsrc;
     }
 
+    const sauthEl = document.getElementById('sauth');
+    if(sauthEl){
+      const auth = (typeof d.authority === 'string' && d.authority) ? d.authority : '';
+      let authLabel = '—';
+      let authStyle = 'color:#C62828';
+      if(auth === 'ntp'){
+        authLabel = (d.authorityStale === true) ? 'NTP (stale)' : 'NTP';
+        authStyle = (d.authorityStale === true) ? 'color:#F9A825' : 'color:#2E7D32';
+      } else if(auth === 'browser'){
+        authLabel = 'Browser';
+        authStyle = 'color:#1565C0';
+      } else if(auth === 'ds3231'){
+        authLabel = 'DS3231';
+        authStyle = 'color:#7B1FA2';
+      } else if(auth === 'internal_rtc'){
+        authLabel = 'Internal RTC';
+        authStyle = 'color:#F9A825';
+      } else if(auth === 'none'){
+        authLabel = 'None';
+        authStyle = 'color:#C62828';
+      }
+      sauthEl.style.cssText = 'font-size:13px;font-weight:700;' + authStyle;
+      sauthEl.textContent = authLabel;
+    }
+
     const stzEl = document.getElementById('stz');
     if(stzEl) stzEl.textContent = (typeof d.tzName === 'string' && d.tzName) ? d.tzName : '\u2014';
 
@@ -2967,10 +3238,10 @@ function loadSys(){
       const dstSec = (typeof d.dstOffset === 'number' && isFinite(d.dstOffset)) ? d.dstOffset : 0;
       if(d.dstActive){
         const dstH = Math.round(dstSec/3600*100)/100;
-        dstEl.textContent = '🌞 ACTIVE (+' + dstH + 'h)';
+        dstEl.textContent = '\u{1F31E} ACTIVE (+' + dstH + 'h)';
         dstEl.style.color = '#E65100';
       } else {
-        dstEl.textContent = '❄️ Standard';
+        dstEl.textContent = '\u2744\uFE0F Standard';
         dstEl.style.color = '#1565C0';
       }
     }
@@ -3026,15 +3297,15 @@ function loadSys(){
 
     const sactEl = document.getElementById('sactmode');
     if(sactEl){
-      let modeText = '🔧 Per-Relay';
-      if(d.globalActiveMode === 1) modeText = '🌍 Global LOW';
-      else if(d.globalActiveMode === 2) modeText = '🌍 Global HIGH';
+      let modeText = '\u{1F527} Per-Relay';
+      if(d.globalActiveMode === 1) modeText = '\u{1F30D} Global LOW';
+      else if(d.globalActiveMode === 2) modeText = '\u{1F30D} Global HIGH';
       sactEl.textContent = modeText;
     }
 
     const srtcEl = document.getElementById('srtc');
     if(srtcEl){
-      srtcEl.textContent = d.rtcPresent ? '✅ Present' : '❌ Not detected';
+      srtcEl.textContent = d.rtcPresent ? '\u2705 Present' : '\u274C Not detected';
       srtcEl.style.color = d.rtcPresent ? '#2E7D32' : '#C62828';
     }
 
@@ -3068,13 +3339,18 @@ function loadSys(){
 
     const stawifiEl = document.getElementById('stawifi');
     if(stawifiEl){
-      const staStatus = d.staEnabled ? (d.wifiConnected ? '✅ Connected' : '⚠️ Enabled but disconnected') : '❌ Disabled';
+      const staStatus = d.staEnabled ? (d.wifiConnected ? '\u2705 Connected' : '\u26A0\uFE0F Enabled but disconnected') : '\u274C Disabled';
       stawifiEl.textContent = staStatus;
       if(d.staEnabled && d.wifiConnected) stawifiEl.style.color = '#2E7D32';
       else if(d.staEnabled) stawifiEl.style.color = '#F9A825';
       else stawifiEl.style.color = '#C62828';
     }
   }).catch(()=>{
+    loadSys._inflight = false;
+    ['sip','sap','shp','sup','srs','stsrc','sauth','stz','sdst','sutc','snt','sbs','sns','sch','smdns','src','sgmt','sdrift','sactmode','srtc','srtcsync','srtctemp','ssyncdir','stawifi'].forEach(id=>{
+      const el = document.getElementById(id);
+      if(el && el.textContent === '\u2026') el.textContent = '\u2014';
+    });
     const el = document.getElementById('stsrc');
     if(el && !el.textContent) el.textContent = '\u2014';
   });
@@ -3254,7 +3530,7 @@ void processNTPResponse() {
                            (uint32_t)ntpPacketBuffer[43];
             uint64_t ntpSecs64 = (uint64_t)secs;
             uint64_t currentEpoch = getCurrentEpoch();
-            if (currentEpoch > 1577836800ULL) {
+            if (currentEpoch >= 1577836800ULL) {
                 uint64_t currentNtp = currentEpoch + NTP_EPOCH_OFFSET;
                 uint64_t eraBase = currentNtp & ~0xFFFFFFFFULL;
                 uint64_t candidate     = eraBase | (uint64_t)secs;
@@ -3413,7 +3689,10 @@ void handleBrowserTimeSync() {
         !timeHasElapsed(nowMs, lastBrowserSync, 86400000UL)) {
         trustCurrentTime = true;
     }
-    if (trustCurrentTime && currentEpoch >= MIN_UNIX_TIME_64) {
+    bool havePriorAuthority = (rtcPresent && rtcTimeValid) ||
+                              (rtcInitialized && internalEpoch > 0);
+    if ((trustCurrentTime || havePriorAuthority) &&
+        currentEpoch >= MIN_UNIX_TIME_64) {
         uint64_t diff = (browserUtcEpoch > currentEpoch)
             ? (browserUtcEpoch - currentEpoch)
             : (currentEpoch - browserUtcEpoch);
@@ -3433,6 +3712,10 @@ void handleBrowserTimeSync() {
             rtc.adjust(dt);
             rtcTimeValid = true;
             lastRTCDSync = millis();
+        } else {
+            rtcPresent = false;
+            rtcTimeValid = false;
+            saveRTCState();
         }
     } else {
         saveRTCState();
@@ -3460,7 +3743,11 @@ void handleBrowserTimeSync() {
     String resp;
     DynamicJsonDocument respDoc(512);
     respDoc["success"] = true;
-    respDoc["utc_epoch"] = (uint32_t)browserUtcEpoch;
+    {
+        char ebuf[24];
+        snprintf(ebuf, sizeof(ebuf), "%llu", (unsigned long long)browserUtcEpoch);
+        respDoc["utc_epoch"] = ebuf;
+    }
     respDoc["local_time"] = timeStr;
     respDoc["local_date"] = dateStr;
     respDoc["weekday"] = weekdayStr;
@@ -3522,7 +3809,8 @@ inline bool isSingleScheduleSlotActive(uint64_t epoch,
             if (sched.days[slot] & (1 << currentWeekday)) return true;
             return false;
         } else if (cur < stop) {
-            uint64_t checkLocalEpoch = getLocalEpoch(epoch) - 86400ULL;
+            uint64_t prevUtcEpoch = epoch - 86400ULL;
+            uint64_t checkLocalEpoch = getLocalEpoch(prevUtcEpoch);
             struct tm* checkDate = gmtime64(&checkLocalEpoch);
             if (!checkDate) return false;
             if (!(monthMask & (1 << checkDate->tm_mon))) return false;
@@ -3639,7 +3927,8 @@ void startMDNS() {
         hostname.replace("_", "-");
         String clean;
         for (char c : hostname) {
-            if (isalnum(c) || c == '-') clean += c;
+            unsigned char uc = (unsigned char)c;
+            if (isalnum(uc) || uc == '-') clean += c;
         }
         if (clean.length() > 0) {
             hostname = clean;
@@ -3660,7 +3949,6 @@ void startMDNS() {
         mdnsStarted = false;
     }
 }
-
 String getMDNSHostname() {
     return String(mdnsHostname);
 }
@@ -3784,12 +4072,12 @@ void loop() {
                       !timeHasElapsed(now, lastNTPSync, getNTPInterval() * 2UL);
     if (rtcPresent && rtcTimeValid && rtcInitialized && !ntpIsFresh) {
         if (timeHasElapsed(now, lastRTCDSync, DS3231_SYNC_INTERVAL)) {
-            lastRTCDSync = now;
             if (rtc.begin()) {
                 DateTime nowDS = rtc.now();
                 if (nowDS.year() >= 2020 && nowDS.year() <= 2100) {
                     uint64_t dsEpoch = rtcDateTimeToUint64(nowDS);
                     if (VALID_UNIX_TIME_64(dsEpoch)) {
+                        lastRTCDSync = now;
                         internalEpoch = dsEpoch;
                         driftCompensation = 1.0f;
                         rtcMicrosAtLastSync = micros();
@@ -3797,6 +4085,9 @@ void loop() {
                         timeSource = TIME_SOURCE_RTC;
                     }
                 }
+            } else {
+                rtcPresent = false;
+                rtcTimeValid = false;
             }
         }
     }
@@ -4143,6 +4434,8 @@ void handleManualControl() {
     int relay = doc["relay"];
     bool state = doc["state"];
     if (relay >= 0 && relay < gpioConfig.count) {
+        bool needsSave = (!relayConfigs[relay].manualOverride) ||
+                         (relayConfigs[relay].manualState != state);
         relayConfigs[relay].manualOverride = true;
         relayConfigs[relay].manualState    = state;
         scheduleActiveCache[relay] = false;
@@ -4150,7 +4443,9 @@ void handleManualControl() {
         lastRelayOutputs[relay] = state;
         lastDebouncedStateGlobal[relay] = state;
         lastStateChangeGlobal[relay] = millis();
-        saveConfiguration();
+        if (needsSave) {
+            saveConfiguration();
+        }
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
@@ -4183,7 +4478,6 @@ void handleResetManual() {
         lastDebouncedStateGlobal[relay] = targetState;
         lastStateChangeGlobal[relay] = millis();
         saveConfiguration();
-        processRelaySchedules();
         server.send(200, "application/json", "{\"success\":true}");
     } else {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid relay\"}");
@@ -4220,12 +4514,18 @@ void handleSaveRelay() {
     int s = 0;
     for (JsonObject sch : schedules) {
         if (s >= 8) break;
-        uint8_t sh = sch["startHour"]   | 0; if (sh > 23) sh = 23;
-        uint8_t sm = sch["startMinute"] | 0; if (sm > 59) sm = 59;
-        uint8_t ss = sch["startSecond"] | 0; if (ss > 59) ss = 59;
-        uint8_t eh = sch["stopHour"]    | 0; if (eh > 23) eh = 23;
-        uint8_t em = sch["stopMinute"]  | 0; if (em > 59) em = 59;
-        uint8_t es = sch["stopSecond"]  | 0; if (es > 59) es = 59;
+        int32_t shRaw = sch["startHour"]   | 0;
+        int32_t smRaw = sch["startMinute"] | 0;
+        int32_t ssRaw = sch["startSecond"] | 0;
+        int32_t ehRaw = sch["stopHour"]    | 0;
+        int32_t emRaw = sch["stopMinute"]  | 0;
+        int32_t esRaw = sch["stopSecond"]  | 0;
+        uint8_t sh = (uint8_t)((shRaw < 0) ? 0 : (shRaw > 23) ? 23 : shRaw);
+        uint8_t sm = (uint8_t)((smRaw < 0) ? 0 : (smRaw > 59) ? 59 : smRaw);
+        uint8_t ss = (uint8_t)((ssRaw < 0) ? 0 : (ssRaw > 59) ? 59 : ssRaw);
+        uint8_t eh = (uint8_t)((ehRaw < 0) ? 0 : (ehRaw > 23) ? 23 : ehRaw);
+        uint8_t em = (uint8_t)((emRaw < 0) ? 0 : (emRaw > 59) ? 59 : emRaw);
+        uint8_t es = (uint8_t)((esRaw < 0) ? 0 : (esRaw > 59) ? 59 : esRaw);
         relayConfigs[relay].schedule.startHour[s]   = sh;
         relayConfigs[relay].schedule.startMinute[s] = sm;
         relayConfigs[relay].schedule.startSecond[s] = ss;
@@ -4291,6 +4591,11 @@ void handleRelayName() {
     const char* name = doc["name"];
     if (relay >= 0 && relay < gpioConfig.count && name) {
         size_t nlen = strlen(name);
+        if (nlen == 0) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"Name cannot be empty\"}");
+            return;
+        }
         if (nlen > 15) {
             nlen = 15;
             while (nlen > 0 && (((uint8_t)name[nlen]) & 0xC0) == 0x80) {
@@ -4319,7 +4624,7 @@ void handleGetTime() {
     String ds = "--/--/----";
     String ws = "";
     uint64_t utcEp = getCurrentEpoch();
-    if (utcEp > MIN_UNIX_TIME_64) {
+    if (utcEp >= MIN_UNIX_TIME_64) {
         uint64_t localEp = getLocalEpoch(utcEp);
         struct tm* t = gmtime64(&localEp);
         if (t) {
@@ -4344,14 +4649,37 @@ void handleGetTime() {
     unsigned long ntpSyncAge = (lastNTPSync > 0)
         ? (millis() - lastNTPSync) / 1000UL
         : 0xFFFFFFFFUL;
-    int32_t dstOff = (utcEp > MIN_UNIX_TIME_64) ? currentDstOffset(utcEp) : 0;
+    String authorityStr = "none";
+    if (utcEp < MIN_UNIX_TIME_64) {
+        authorityStr = "none";
+    } else if (timeSource == TIME_SOURCE_NTP && lastNTPSync > 0 &&
+               !timeHasElapsed(millis(), lastNTPSync, getNTPInterval() * 2UL)) {
+        authorityStr = "ntp";
+    } else if (timeSource == TIME_SOURCE_BROWSER && lastBrowserSync > 0 &&
+               !timeHasElapsed(millis(), lastBrowserSync, 86400000UL)) {
+        authorityStr = "browser";
+    } else if (rtcPresent && rtcTimeValid) {
+        authorityStr = "ds3231";
+    } else if (rtcInitialized && internalEpoch > 0) {
+        authorityStr = "internal_rtc";
+    } else {
+        authorityStr = "none";
+    }
+    bool authorityStale = false;
+    if (authorityStr == "ntp" && ntpSyncAge != 0xFFFFFFFFUL &&
+        timeHasElapsed(millis(), lastNTPSync, getNTPInterval())) {
+        authorityStale = true;
+    }
+    int32_t dstOff = (utcEp >= MIN_UNIX_TIME_64) ? currentDstOffset(utcEp) : 0;
     bool dstOn = (dstOff != 0);
     String tzName = String(sysConfig.tz_name);
     String resp = "{\"time\":\"" + ts + "\",\"date\":\"" + ds + "\",\"weekday\":\"" + ws + "\",\"wifi\":" +
                   String(wifiConnected ? "true" : "false") + ",\"ntp\":" +
                   String((timeSource == TIME_SOURCE_NTP) ? "true" : "false") +
                   ",\"timeSource\":\"" + timeSourceStr +
-                  "\",\"rtcPresent\":" + String(rtcPresent ? "true" : "false") +
+                  "\",\"authority\":\"" + authorityStr +
+                  "\",\"authorityStale\":" + String(authorityStale ? "true" : "false") +
+                  ",\"rtcPresent\":" + String(rtcPresent ? "true" : "false") +
                   ",\"rtcSynced\":" + String(rtcTimeValid ? "true" : "false") +
                   ",\"rtcSyncAge\":" + String(rtcSyncAge) +
                   ",\"ntpSyncAge\":" + String(ntpSyncAge) +
@@ -4517,7 +4845,7 @@ void handleGetNTP() {
     doc["tzRuleId"] = sysConfig.tz_rule_id;
     doc["tzAutoDst"] = sysConfig.tz_auto_dst ? 1 : 0;
     uint64_t now = getCurrentEpoch();
-    int32_t dstOff = (now > MIN_UNIX_TIME_64) ? currentDstOffset(now) : 0;
+    int32_t dstOff = (now >= MIN_UNIX_TIME_64) ? currentDstOffset(now) : 0;
     doc["dstOffset"] = dstOff;
     doc["dstActive"] = (dstOff != 0);
     String resp;
@@ -4582,12 +4910,13 @@ void handleSaveNTP() {
     }
     uint8_t newSyncHours = 0;
     if (hasSyncHours) {
-        newSyncHours = doc["syncHours"];
-        if (newSyncHours < 1 || newSyncHours > 24) {
+        int32_t syncHoursRaw = doc["syncHours"] | 0;
+        if (syncHoursRaw < 1 || syncHoursRaw > 24) {
             server.send(400, "application/json",
                 "{\"success\":false,\"error\":\"syncHours must be 1-24\"}");
             return;
         }
+        newSyncHours = (uint8_t)syncHoursRaw;
     }
     bool changed = false;
     bool tzChanged = false;
@@ -4727,8 +5056,14 @@ void handleSaveAP() {
         }
     }
     if (doc.containsKey("ap_channel")) {
-        uint8_t ch = doc["ap_channel"];
-        if (ch >= 1 && ch <= 13 && ch != extConfig.ap_channel) {
+        int chRaw = doc["ap_channel"] | 0;
+        if (chRaw < 1 || chRaw > 13) {
+            server.send(400, "application/json",
+                "{\"success\":false,\"error\":\"Channel must be 1-13\"}");
+            return;
+        }
+        uint8_t ch = (uint8_t)chRaw;
+        if (ch != extConfig.ap_channel) {
             extConfig.ap_channel = ch;
             channelChanged = true;
         }
@@ -4759,6 +5094,9 @@ void handleSaveAP() {
 }
 
 void handleGetSystem() {
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
     DynamicJsonDocument doc(3072);
     doc["ip"] = WiFi.localIP().toString();
     doc["ap_ip"] = WiFi.softAPIP().toString();
@@ -4772,6 +5110,27 @@ void handleGetSystem() {
     else if (timeSource == TIME_SOURCE_BROWSER) timeSourceStr = "Browser";
     else if (timeSource == TIME_SOURCE_RTC) timeSourceStr = rtcPresent ? "DS3231" : "Internal RTC";
     doc["timeSource"] = timeSourceStr;
+    uint64_t _authNowEp = getCurrentEpoch();
+    String authorityStr = "none";
+    bool authorityStale = false;
+    if (_authNowEp < MIN_UNIX_TIME_64) {
+        authorityStr = "none";
+    } else if (timeSource == TIME_SOURCE_NTP && lastNTPSync > 0 &&
+               !timeHasElapsed(millis(), lastNTPSync, getNTPInterval() * 2UL)) {
+        authorityStr = "ntp";
+        if (timeHasElapsed(millis(), lastNTPSync, getNTPInterval())) authorityStale = true;
+    } else if (timeSource == TIME_SOURCE_BROWSER && lastBrowserSync > 0 &&
+               !timeHasElapsed(millis(), lastBrowserSync, 86400000UL)) {
+        authorityStr = "browser";
+    } else if (rtcPresent && rtcTimeValid) {
+        authorityStr = "ds3231";
+    } else if (rtcInitialized && internalEpoch > 0) {
+        authorityStr = "internal_rtc";
+    } else {
+        authorityStr = "none";
+    }
+    doc["authority"] = authorityStr;
+    doc["authorityStale"] = authorityStale;
     if (timeSource == TIME_SOURCE_NTP) {
         doc["syncDirection"] = rtcPresent ? "NTP \u2192 RTC \u2192 DS3231" : "NTP \u2192 Internal RTC";
     } else if (timeSource == TIME_SOURCE_BROWSER) {
@@ -4816,7 +5175,7 @@ void handleGetSystem() {
     doc["tzName"] = sysConfig.tz_name;
     doc["tzAutoDst"] = sysConfig.tz_auto_dst ? 1 : 0;
     uint64_t nowEp = getCurrentEpoch();
-    int32_t dstOff = (nowEp > MIN_UNIX_TIME_64) ? currentDstOffset(nowEp) : 0;
+    int32_t dstOff = (nowEp >= MIN_UNIX_TIME_64) ? currentDstOffset(nowEp) : 0;
     doc["dstActive"] = (dstOff != 0);
     doc["dstOffset"] = dstOff;
     float rtcTempVal = getRTCTemperature();
