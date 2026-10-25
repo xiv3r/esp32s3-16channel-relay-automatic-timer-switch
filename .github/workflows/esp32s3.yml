@@ -17,7 +17,7 @@ jobs:
       run: |
         sudo apt update
         sudo apt install wget -y
-        wget -O arduino-cli.deb https://github.com/arduino/arduino-cli/releases/download/v1.5.1/arduino-cli_1.5.1-1_amd64.deb
+        wget -O arduino-cli.deb https://github.com/xiv3r/esp32-automatic-timer-switch/releases/download/flasher/arduino-cli_1.5.2-rc.1-1_amd64.deb
         sudo dpkg -i arduino-cli.deb
         sudo apt --fix-broken install -y
         sudo dpkg --configure -a
@@ -33,8 +33,8 @@ jobs:
         
         # Compile Firmware
         mv *.ino esp32s3-16channel-relay-automatic-timer-switch.ino
-        arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi --clean --output-dir firmware .
-
+        arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB --output-dir firmware .
+        
         # Rename
         mv firmware/*.ino.bin             firmware/esp32s3-firmware-0x10000.bin
         mv firmware/*.ino.bootloader.bin  firmware/esp32s3-bootloader-0x0.bin
