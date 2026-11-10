@@ -778,6 +778,10 @@ void initRTC() {
     rtcTimeValid = false;
     rtcFailCount = 0;
     if (rtc.lostPower()) {
+        Wire.beginTransmission(0x68);
+        Wire.write(0x0F);
+        Wire.write(0x00);
+        Wire.endTransmission();
         return;
     }
     DateTime now = rtc.now();
@@ -1121,6 +1125,10 @@ bool SelfHealingSystem::recoverRTC() {
         return true;
     }
     if (rtc.lostPower()) {
+        Wire.beginTransmission(0x68);
+        Wire.write(0x0F);
+        Wire.write(0x00);
+        Wire.endTransmission();
         return false;
     }
     DateTime now = rtc.now();
@@ -2993,7 +3001,8 @@ function renderGPIOPins(d) {
     }
     
     for(let i=0; i<d.count; i++) {
-        const activeLow = d.activeLow ? d.activeLow[i] : true;
+        const storedActiveLow = d.activeLow ? d.activeLow[i] : true;
+        const activeLow = isGlobalMode ? (globalMode === 1) : storedActiveLow;
         pinsHtml += `<div style="display:flex;align-items:center;gap:10px;padding:10px;border:1px solid #E3E8EF;border-radius:7px;margin-bottom:6px;background:#FAFAFA">
             <span style="font-weight:700;min-width:60px">Relay ${i+1}</span>
             <span style="flex:1">GPIO <strong>${d.pins[i]}</strong></span>
@@ -4163,13 +4172,42 @@ inline bool isSingleScheduleSlotActive(uint64_t epoch,
             if (sched.days[slot] & (1 << currentWeekday)) return true;
             return false;
         } else if (cur < stop) {
-            uint64_t prevUtcEpoch = epoch - 86400ULL;
-            uint64_t checkLocalEpoch = getLocalEpoch(prevUtcEpoch);
-            struct tm* checkDate = gmtime64(&checkLocalEpoch);
-            if (!checkDate) return false;
-            if (!(monthMask & (1 << checkDate->tm_mon))) return false;
-            if (!(monthDayMask & (1 << (checkDate->tm_mday - 1)))) return false;
-            if (sched.days[slot] & (1 << checkDate->tm_wday)) return true;
+            uint64_t todayLocal = getLocalEpoch(epoch);
+            struct tm* todayTm = gmtime64(&todayLocal);
+            if (!todayTm) return false;
+            int todayY   = todayTm->tm_year;
+            int todayMon = todayTm->tm_mon;
+            int todayDay = todayTm->tm_mday;
+
+            const int32_t kOffsetCandidates[3] = { -86400, -82800, -90000 };
+            bool foundPrev = false;
+            struct tm prevTmCopy;
+            memset(&prevTmCopy, 0, sizeof(prevTmCopy));
+            for (uint8_t oi = 0; oi < 3; oi++) {
+                int64_t candUtc = (int64_t)epoch + (int64_t)kOffsetCandidates[oi];
+                if (candUtc <= 0) continue;
+                uint64_t candLocalEpoch = getLocalEpoch((uint64_t)candUtc);
+                struct tm* candTm = gmtime64(&candLocalEpoch);
+                if (!candTm) continue;
+                int64_t daysToday = (int64_t)daysFromYMD(
+                    (uint16_t)(todayY + 1900),
+                    (uint8_t)(todayMon + 1),
+                    (uint8_t)todayDay);
+                int64_t daysCand = (int64_t)daysFromYMD(
+                    (uint16_t)(candTm->tm_year + 1900),
+                    (uint8_t)(candTm->tm_mon + 1),
+                    (uint8_t)candTm->tm_mday);
+                if (daysToday - daysCand == 1) {
+                    prevTmCopy = *candTm;
+                    foundPrev = true;
+                    break;
+                }
+            }
+            if (!foundPrev) return false;
+
+            if (!(monthMask & (1 << prevTmCopy.tm_mon))) return false;
+            if (!(monthDayMask & (1 << (prevTmCopy.tm_mday - 1)))) return false;
+            if (sched.days[slot] & (1 << prevTmCopy.tm_wday)) return true;
             return false;
         } else {
             return false;
@@ -5511,8 +5549,12 @@ void handleGetRelays() {
                 sch["monthMask"] = relayConfigs[i].schedule.monthMask[s];
             }
             String chunk;
-            serializeJson(relayDoc, chunk);
-            server.sendContent(chunk);
+            size_t written = serializeJson(relayDoc, chunk);
+            if (written == 0) {
+                server.sendContent("{}");
+            } else {
+                server.sendContent(chunk);
+            }
             yield();
         }
     }
@@ -5643,17 +5685,28 @@ void handleSaveRelay() {
             relayConfigs[relay].schedule.enabled[s] = false;
         }
         if (sch.containsKey("days")) {
-            relayConfigs[relay].schedule.days[s] = sch["days"].as<uint8_t>() & 0x7F;
+            int32_t rawDays = sch["days"] | 0;
+            relayConfigs[relay].schedule.days[s] =
+                (rawDays < 0) ? DAY_ALL : (uint8_t)(rawDays & 0x7F);
         } else {
             relayConfigs[relay].schedule.days[s] = DAY_ALL;
         }
         uint32_t rawMonthDays = 0x7FFFFFFFUL;
-        if (sch.containsKey("monthDays") && sch["monthDays"].is<uint32_t>()) {
-            rawMonthDays = sch["monthDays"].as<uint32_t>();
+        if (sch.containsKey("monthDays")) {
+            int64_t signedRaw = sch["monthDays"] | (int64_t)0x7FFFFFFF;
+            if (signedRaw < 0) {
+                rawMonthDays = 0x7FFFFFFFUL;
+            } else if (signedRaw <= (int64_t)0x7FFFFFFF) {
+                rawMonthDays = (uint32_t)signedRaw;
+            } else {
+                rawMonthDays = (uint32_t)((uint64_t)signedRaw & 0x7FFFFFFFULL);
+            }
         }
-        relayConfigs[relay].schedule.monthDays[s] = rawMonthDays & 0x7FFFFFFFUL;
+        relayConfigs[relay].schedule.monthDays[s] = rawMonthDays;
         if (sch.containsKey("monthMask")) {
-            relayConfigs[relay].schedule.monthMask[s] = sch["monthMask"].as<uint16_t>() & 0x0FFF;
+            int32_t rawMask = sch["monthMask"] | 0;
+            relayConfigs[relay].schedule.monthMask[s] =
+                (rawMask < 0) ? MONTH_ALL : (uint16_t)(rawMask & 0x0FFF);
         } else {
             relayConfigs[relay].schedule.monthMask[s] = MONTH_ALL;
         }
@@ -5973,8 +6026,13 @@ void handleSaveNTP() {
     }
     bool hasNtpServer = doc.containsKey("ntpServer");
     bool hasTzName    = doc.containsKey("tzName");
-    bool hasGmtOffset = doc.containsKey("gmtOffset") && !hasTzName;
-    bool hasDstOffset = doc.containsKey("daylightOffset") && !hasTzName;
+    bool isManualTz   = false;
+    if (hasTzName) {
+        const char* tzn = doc["tzName"];
+        if (tzn && strcmp(tzn, "Manual") == 0) isManualTz = true;
+    }
+    bool hasGmtOffset = doc.containsKey("gmtOffset") && (!hasTzName || isManualTz);
+    bool hasDstOffset = doc.containsKey("daylightOffset") && (!hasTzName || isManualTz);
     bool hasSyncHours = doc.containsKey("syncHours");
     if (hasNtpServer) {
         const char* srv = doc["ntpServer"];
@@ -6458,12 +6516,14 @@ void handleSaveGPIOConfig() {
         }
     }
     for (uint8_t i = 0; i < gpioConfig.count; i++) {
-        pinMode(gpioConfig.pins[i], OUTPUT);
         int matchIdx = -1;
         for (uint8_t k = 0; k < oldCount; k++) {
             if (oldPins[k] == gpioConfig.pins[i]) { matchIdx = k; break; }
         }
         bool state = (matchIdx >= 0) ? oldRelayOutputs[matchIdx] : false;
+        int pin = gpioConfig.pins[i];
+        digitalWrite(pin, isActiveLow(i) ? !state : state);
+        pinMode(pin, OUTPUT);
         setRelayOutput(i, state);
         lastRelayOutputs[i] = state;
         lastDebouncedStateGlobal[i] = state;
@@ -6527,6 +6587,7 @@ void handleAddGPIO() {
     lastDebouncedStateGlobal[gpioConfig.count] = false;
     lastStateChangeGlobal[gpioConfig.count] = 0;
     gpioConfig.count++;
+    digitalWrite(newPin, isActiveLow(gpioConfig.count - 1) ? HIGH : LOW);
     pinMode(newPin, OUTPUT);
     setRelayOutput(gpioConfig.count - 1, false);
     lastRelayOutputs[gpioConfig.count - 1] = false;
@@ -6608,6 +6669,11 @@ void handleToggleActiveLow() {
     uint8_t index = doc["index"];
     if (index >= gpioConfig.count) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid index\"}");
+        return;
+    }
+    if (extConfig.global_active_mode != 0) {
+        server.send(400, "application/json",
+            "{\"success\":false,\"error\":\"Per-relay active level is overridden by global mode\"}");
         return;
     }
     bool logicalState = lastRelayOutputs[index];
